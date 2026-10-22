@@ -1,0 +1,71 @@
+version: "2"
+
+run:
+  timeout: 5m
+  # Lint integration-tagged files too.
+  build-tags:
+    - integration
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose
+    - contextcheck
+    - errorlint
+    - gocritic
+    - gosec
+    - misspell
+    - noctx
+    - nolintlint
+    - revive
+    - sloglint
+    - unconvert
+    - usestdlibvars
+  settings:
+    errcheck:
+      exclude-functions:
+        - (net/http.ResponseWriter).Write
+    gosec:
+      excludes:
+        - G104 # duplicate of errcheck
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    revive:
+      rules:
+        - name: exported
+        - name: package-comments
+        - name: context-as-argument
+        - name: error-return
+        - name: error-strings
+        - name: errorf
+        - name: unused-parameter
+    sloglint:
+      kv-only: false
+      no-global: ""
+      context: ""
+  exclusions:
+    generated: lax
+    paths:
+      - frontend/node_modules
+    presets:
+      - std-error-handling
+    rules:
+      # Tests may use fixed credentials, ad-hoc HTTP requests, and blank params.
+      - path: _test\.go
+        linters:
+          - gosec
+          - noctx
+          - bodyclose
+
+formatters:
+  exclusions:
+    paths:
+      - frontend/node_modules
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/oguzyildirim/smart-campaign-composer

@@ -25,25 +25,43 @@ Never send real SMS or email.
 
 ## Commands
 
-Planned targets — keep this list in sync with the Makefile and
-docker-compose.yml once they exist. Never list a command that does not work.
+Keep this list in sync with the Makefile and docker-compose.yml.
+Never list a command that does not work.
 
-- `docker compose up` — full stack: Postgres, Kafka, migrations, seed data,
-  mock provider, API, worker, frontend.
-- `make test` — all Go and frontend tests; must pass without
-  `ANTHROPIC_API_KEY` (mock LLM).
-- `make lint` — golangci-lint and frontend lint/type checks.
-- `go test ./internal/<pkg>/... -run <TestName>` — run a single Go test.
+- `docker compose up` (or `make up`, detached) — full stack: Postgres,
+  Kafka (KRaft), one-shot migrations, one-shot seed (5000 fake users;
+  skipped if users exist), mock provider, API, worker, frontend.
+  Requires `.env` copied from `.env.example`.
+- `make test` — all Go tests (unit + `integration`-tagged testcontainers
+  tests; Docker required) and frontend tests; no `ANTHROPIC_API_KEY` needed.
+- `make test-unit` — Go unit tests (`-race`) and frontend tests; no Docker.
+- `make lint` — golangci-lint (pinned, installed into `bin/`), ESLint, vue-tsc.
+- `make fmt` — gofmt + goimports.
+- `go test ./internal/<pkg>/... -run <TestName>` — run a single Go test
+  (add `-tags=integration` for integration tests).
 - `cd frontend && npm test` — frontend unit tests.
 
-## Repository Layout (planned)
+Use explicit Go package roots (`./cmd/... ./internal/... ./mock-provider/...`),
+not `./...`: `frontend/node_modules` contains stray `.go` files.
 
-- `cmd/api`, `cmd/worker` — separate API and worker entry points.
-- `internal/` — domain logic, services, and adapters (Postgres, Kafka,
-  Claude client, messaging provider client).
-- `migrations/` — versioned SQL migrations.
-- `mock-provider/` — local mock SMS/email provider.
-- `frontend/` — Vue 3 + TypeScript + Vite application.
+## Repository Layout
+
+- `cmd/api`, `cmd/worker`, `cmd/seed` — entry points (wiring only).
+- `mock-provider/` — local mock SMS/email provider (own main package).
+- `internal/config` — env configuration, validation, redacting `Secret` type.
+- `internal/health` — liveness/readiness handlers and the `Checker` interface.
+- `internal/worker` — worker lifecycle.
+- `internal/segment` — domain: segment rule DSL (strict parse/validate,
+  compile to parameterized SQL), preview service, `AudienceCounter` port.
+- `internal/seed` — deterministic fake-data generator and transactional loader.
+- `internal/httpapi` — `/api/v1` HTTP handlers; map domain errors to status codes.
+- `internal/platform/` — infrastructure adapters: `httpserver`, `logging`,
+  `postgres` (pool, health, audience repository with consent filter),
+  `kafka`. Domain packages live under `internal/` and must not import
+  HTTP or infrastructure code.
+- `internal/testutil/` — integration-test helpers (`integration` build tag).
+- `migrations/` — versioned SQL migrations (golang-migrate).
+- `frontend/` — Vue 3 + TypeScript + Vite application (Vitest, ESLint).
 - `ai-sessions/` — Claude session exports, written automatically by the
   `SessionEnd` hook; never hand-edited or mixed into source commits.
 

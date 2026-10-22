@@ -1,0 +1,5 @@
+DROP TABLE IF EXISTS orders;
+DROP TABLE IF EXISTS cart_events;
+DROP TABLE IF EXISTS channel_consents;
+DROP TABLE IF EXISTS users;
+DROP FUNCTION IF EXISTS city_key(text);
