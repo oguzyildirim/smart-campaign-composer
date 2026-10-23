@@ -15,5 +15,3 @@ Call the Skill tool with "golang-how-to" where possible, to understand how to wr
 Run typechecking regularly, single test files regularly, and the full test suite once at the end.
 
 Once done, call the Skill tool with "code-review" to review the work.
-
-Commit your work to the current branch.

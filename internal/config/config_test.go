@@ -125,6 +125,7 @@ func TestLoad_Invalid(t *testing.T) {
 		{"zero attempts", "LLM_MAX_ATTEMPTS", "0", "LLM_MAX_ATTEMPTS: must be an integer between 1 and 3"},
 		{"too many attempts", "LLM_MAX_ATTEMPTS", "4", "LLM_MAX_ATTEMPTS: must be an integer between 1 and 3"},
 		{"negative sdk retries", "LLM_SDK_MAX_RETRIES", "-1", "LLM_SDK_MAX_RETRIES: must be an integer between 0 and 5"},
+		{"mock stream delay above max", "LLM_MOCK_STREAM_DELAY", "2s", "LLM_MOCK_STREAM_DELAY: must be greater than 0"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -177,6 +178,7 @@ func TestLoad_LLM(t *testing.T) {
 		Provider: LLMProviderMock, Model: DefaultAnthropicModel,
 		SegmentTimeout: DefaultLLMSegmentTimeout, DraftsTimeout: DefaultLLMDraftsTimeout,
 		MaxAttempts: DefaultLLMMaxAttempts, SDKMaxRetries: DefaultLLMSDKMaxRetries,
+		MockStreamDelay: DefaultLLMMockStreamDelay,
 	}
 	if cfg.LLM != want {
 		t.Errorf("LLM defaults = %+v, want %+v", cfg.LLM, want)
@@ -188,6 +190,7 @@ func TestLoad_LLM(t *testing.T) {
 	env["LLM_DRAFTS_TIMEOUT"] = "90s"
 	env["LLM_MAX_ATTEMPTS"] = "3"
 	env["LLM_SDK_MAX_RETRIES"] = "0"
+	env["LLM_MOCK_STREAM_DELAY"] = "5ms"
 	cfg, err = Load(envFrom(env))
 	if err != nil {
 		t.Fatal(err)
@@ -195,7 +198,7 @@ func TestLoad_LLM(t *testing.T) {
 	want = LLMConfig{
 		Provider: LLMProviderMock, Model: "claude-opus-5-5",
 		SegmentTimeout: 5 * time.Second, DraftsTimeout: 90 * time.Second,
-		MaxAttempts: 3, SDKMaxRetries: 0,
+		MaxAttempts: 3, SDKMaxRetries: 0, MockStreamDelay: 5 * time.Millisecond,
 	}
 	if cfg.LLM != want {
 		t.Errorf("LLM overrides = %+v, want %+v", cfg.LLM, want)

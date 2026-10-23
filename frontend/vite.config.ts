@@ -10,7 +10,13 @@ export default defineConfig({
   plugins: [vue()],
   server: {
     port: 5173,
+    // First match wins: /api/v1 is served by the Go API under the same
+    // path; other /api paths (health checks) have the prefix stripped,
+    // matching nginx.conf.
     proxy: {
+      '/api/v1': {
+        target: process.env.API_PROXY_TARGET ?? 'http://localhost:8080',
+      },
       '/api': {
         target: process.env.API_PROXY_TARGET ?? 'http://localhost:8080',
         rewrite: (path) => path.replace(/^\/api/, ''),

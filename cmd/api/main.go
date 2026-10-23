@@ -34,6 +34,14 @@ import (
 
 const service = "api"
 
+const (
+	// previewSamples is the number of recipients a preview renders per
+	// channel.
+	previewSamples = 3
+	// sseHeartbeat keeps idle proxies from closing a draft stream.
+	sseHeartbeat = 15 * time.Second
+)
+
 func main() {
 	if len(os.Args) == 3 && os.Args[1] == "healthcheck" {
 		if err := httpserver.Probe(context.Background(), os.Args[2]); err != nil {
@@ -82,14 +90,20 @@ func run(ctx context.Context) error {
 		"kafka":    kafka.NewChecker(kafkaClient),
 	}, cfg.ReadinessTimeout, logger)
 
-	segments := segment.NewService(postgres.NewAudienceRepository(pool), time.Now)
+	audience := postgres.NewAudienceRepository(pool)
+	segments := segment.NewService(audience, time.Now)
 	generator := campaign.NewGenerator(newLLMClient(cfg, logger), segments, campaign.GeneratorConfig{
 		SegmentTimeout: cfg.LLM.SegmentTimeout,
 		DraftsTimeout:  cfg.LLM.DraftsTimeout,
 		MaxAttempts:    cfg.LLM.MaxAttempts,
 	}, logger)
+	campaigns := campaign.NewService(generator, postgres.NewCampaignStore(pool), audience, campaign.ServiceConfig{
+		GenerationTimeout: cfg.LLM.RouteTimeout(),
+		PreviewSamples:    previewSamples,
+	}, time.Now, logger)
 
-	// Timeouts are per route group: LLM routes need room for every attempt.
+	// Timeouts are per route: LLM routes need room for every attempt, and
+	// the draft stream is bounded by the service's generation timeout.
 	router := httpserver.NewRouter(logger, 0)
 	defaultTimeout := middleware.Timeout(cfg.API.RequestTimeout)
 	router.With(defaultTimeout).Get("/healthz", health.LivenessHandler())
@@ -99,9 +113,12 @@ func run(ctx context.Context) error {
 			r.Use(defaultTimeout)
 			httpapi.MountSegments(r, segments, logger)
 		})
-		r.Group(func(r chi.Router) {
-			r.Use(middleware.Timeout(cfg.LLM.RouteTimeout()))
-			httpapi.MountAI(r, generator, logger)
+		httpapi.MountCampaigns(r, httpapi.CampaignRoutes{
+			Service:        campaigns,
+			Logger:         logger,
+			RequestTimeout: cfg.API.RequestTimeout,
+			CreateTimeout:  cfg.LLM.RouteTimeout(),
+			Heartbeat:      sseHeartbeat,
 		})
 	})
 
@@ -119,5 +136,5 @@ func newLLMClient(cfg config.Config, logger *slog.Logger) llm.Client {
 			MaxRetries: cfg.LLM.SDKMaxRetries,
 		}, logger)
 	}
-	return mockllm.New()
+	return mockllm.New().WithStreamDelay(cfg.LLM.MockStreamDelay)
 }

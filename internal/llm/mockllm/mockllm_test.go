@@ -111,3 +111,28 @@ func TestClient_CancelledWhileStreaming(t *testing.T) {
 		t.Errorf("got %d deltas after cancel, want 1", deltas)
 	}
 }
+
+func TestGenerateDrafts_StreamDelay(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := New().WithStreamDelay(50 * time.Millisecond)
+		chunks := 0
+		start := time.Now()
+		if _, err := c.GenerateDrafts(t.Context(), llm.DraftRequest{Brief: exampleBrief}, func(string) { chunks++ }); err != nil {
+			t.Fatal(err)
+		}
+		if want := time.Duration(chunks-1) * 50 * time.Millisecond; time.Since(start) != want {
+			t.Errorf("elapsed = %v, want %v for %d chunks", time.Since(start), want, chunks)
+		}
+	})
+}
+
+func TestGenerateDrafts_StreamDelayHonorsCancellation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		c := New().WithStreamDelay(time.Hour)
+		_, err := c.GenerateDrafts(ctx, llm.DraftRequest{Brief: exampleBrief}, func(string) { cancel() })
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("error = %v, want context.Canceled", err)
+		}
+	})
+}

@@ -57,3 +57,38 @@ func TestParseTemplate(t *testing.T) {
 		})
 	}
 }
+
+func TestTemplate_Render(t *testing.T) {
+	values := map[Variable]string{VarFirstName: "Ayşe", VarCity: "İzmir"}
+	tests := []struct {
+		input, want string
+		wantRunes   int
+	}{
+		{"Merhaba {{first_name}}!", "Merhaba Ayşe!", 13},
+		{"{{first_name}} / {{city}} / {{first_name}}", "Ayşe / İzmir / Ayşe", 19},
+		{"no variables {here}", "no variables {here}", 19},
+		{"", "", 0},
+	}
+	for _, tt := range tests {
+		tmpl, err := ParseTemplate(tt.input)
+		if err != nil {
+			t.Fatalf("ParseTemplate(%q) error = %v", tt.input, err)
+		}
+		if got := tmpl.Render(values); got != tt.want {
+			t.Errorf("Render(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+		if got := tmpl.RunesWith(map[Variable]int{VarFirstName: 4, VarCity: 5}); got != tt.wantRunes {
+			t.Errorf("RunesWith(%q) = %d, want %d", tt.input, got, tt.wantRunes)
+		}
+	}
+}
+
+func TestTemplate_RenderMissingValueIsEmpty(t *testing.T) {
+	tmpl, err := ParseTemplate("Hi {{first_name}} from {{city}}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := tmpl.Render(map[Variable]string{VarCity: "Bursa"}); got != "Hi  from Bursa" {
+		t.Errorf("Render() = %q", got)
+	}
+}

@@ -58,6 +58,13 @@ var placeholderName = regexp.MustCompile(`^[a-z_]+$`)
 type Template struct {
 	literalRunes int
 	vars         []Variable // in order of appearance, with repeats
+	parts        []part
+}
+
+// part is a literal run or, when v is set, a variable reference.
+type part struct {
+	literal string
+	v       Variable
 }
 
 // ParseTemplate parses s strictly. A "{{" must be followed by an
@@ -73,13 +80,13 @@ func ParseTemplate(s string) (Template, error) {
 			if closing >= 0 {
 				return Template{}, ErrMalformedPlaceholder
 			}
-			t.literalRunes += utf8.RuneCountInString(rest)
+			t.addLiteral(rest)
 			return t, nil
 		}
 		if closing >= 0 && closing < open {
 			return Template{}, ErrMalformedPlaceholder
 		}
-		t.literalRunes += utf8.RuneCountInString(rest[:open])
+		t.addLiteral(rest[:open])
 
 		after := rest[open+2:]
 		end := strings.Index(after, "}}")
@@ -95,18 +102,47 @@ func ParseTemplate(s string) (Template, error) {
 			return Template{}, ErrUnknownVariable
 		}
 		t.vars = append(t.vars, v)
+		t.parts = append(t.parts, part{v: v})
 		rest = after[end+2:]
 	}
+}
+
+func (t *Template) addLiteral(s string) {
+	if s == "" {
+		return
+	}
+	t.literalRunes += utf8.RuneCountInString(s)
+	t.parts = append(t.parts, part{literal: s})
+}
+
+// Render substitutes values for variables. A variable without a value
+// renders as empty text.
+func (t Template) Render(values map[Variable]string) string {
+	var b strings.Builder
+	for _, p := range t.parts {
+		if p.v != "" {
+			b.WriteString(values[p.v])
+			continue
+		}
+		b.WriteString(p.literal)
+	}
+	return b.String()
+}
+
+// RunesWith is the rendered length when each variable takes the length
+// given in lengths (0 when absent).
+func (t Template) RunesWith(lengths map[Variable]int) int {
+	n := t.literalRunes
+	for _, v := range t.vars {
+		n += lengths[v]
+	}
+	return n
 }
 
 // WorstCaseRunes is the rendered length when every variable takes its
 // maximum length.
 func (t Template) WorstCaseRunes() int {
-	n := t.literalRunes
-	for _, v := range t.vars {
-		n += variableMaxRunes[v]
-	}
-	return n
+	return t.RunesWith(variableMaxRunes)
 }
 
 // Variables returns the distinct variables used, in order of first use.

@@ -280,7 +280,7 @@ func TestGenerator_UpstreamFailures(t *testing.T) {
 			}
 
 			f = newFixture(t, []mockllm.Step{{Fault: tt.fault}})
-			_, err = f.gen.GenerateDrafts(t.Context(), exampleBrief, nil)
+			_, err = f.gen.GenerateDrafts(t.Context(), exampleBrief, "", nil)
 			requireCode(t, err, tt.want)
 		})
 	}
@@ -299,7 +299,7 @@ func TestGenerator_Timeout(t *testing.T) {
 		}
 
 		start = time.Now()
-		_, err = f.gen.GenerateDrafts(t.Context(), exampleBrief, nil)
+		_, err = f.gen.GenerateDrafts(t.Context(), exampleBrief, "", nil)
 		requireCode(t, err, CodeTimeout)
 		if elapsed := time.Since(start); elapsed != 7*time.Second {
 			t.Errorf("drafts call took %s, want exactly the 7s timeout", elapsed)
@@ -328,7 +328,7 @@ func TestGenerator_Cancellation(t *testing.T) {
 		var segErr, draftErr error
 		var wg sync.WaitGroup
 		wg.Go(func() { _, segErr = f.gen.ProposeSegment(ctx, exampleBrief) })
-		wg.Go(func() { _, draftErr = f.gen.GenerateDrafts(ctx, exampleBrief, nil) })
+		wg.Go(func() { _, draftErr = f.gen.GenerateDrafts(ctx, exampleBrief, "", nil) })
 		synctest.Wait() // both calls are blocked inside the LLM
 		start := time.Now()
 		cancel()
@@ -355,7 +355,7 @@ func TestGenerator_GenerateDrafts_Example(t *testing.T) {
 	f := newFixture(t, nil)
 	var deltas []Delta
 
-	got, err := f.gen.GenerateDrafts(t.Context(), exampleBrief, func(d Delta) { deltas = append(deltas, d) })
+	got, err := f.gen.GenerateDrafts(t.Context(), exampleBrief, "", func(d Delta) { deltas = append(deltas, d) })
 	if err != nil {
 		t.Fatalf("GenerateDrafts() error = %v", err)
 	}
@@ -406,7 +406,7 @@ func TestGenerator_GenerateDrafts_InvalidOutput(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newFixture(t, steps(tt.out, 2))
-			_, err := f.gen.GenerateDrafts(t.Context(), exampleBrief, nil)
+			_, err := f.gen.GenerateDrafts(t.Context(), exampleBrief, "", nil)
 			requireCode(t, err, CodeInvalidOutput)
 			if n := len(f.llm.Calls()); n != 2 {
 				t.Errorf("LLM calls = %d, want 2", n)
@@ -418,7 +418,7 @@ func TestGenerator_GenerateDrafts_InvalidOutput(t *testing.T) {
 func TestGenerator_GenerateDrafts_RepairSucceeds(t *testing.T) {
 	f := newFixture(t, []mockllm.Step{{Fault: mockllm.FaultOverlongSMS}})
 	var attempts []int
-	got, err := f.gen.GenerateDrafts(t.Context(), exampleBrief, func(d Delta) {
+	got, err := f.gen.GenerateDrafts(t.Context(), exampleBrief, "", func(d Delta) {
 		if !slices.Contains(attempts, d.Attempt) {
 			attempts = append(attempts, d.Attempt)
 		}
@@ -442,7 +442,7 @@ func TestGenerator_GenerateDrafts_DeltasCapped(t *testing.T) {
 	huge := `{"sms":{"body":"` + strings.Repeat("a", 3*MaxDraftsOutputBytes) + `"}}`
 	f := newFixture(t, steps(huge, 1), func(c *GeneratorConfig) { c.MaxAttempts = 1 })
 	var forwarded int
-	_, err := f.gen.GenerateDrafts(t.Context(), exampleBrief, func(d Delta) { forwarded += len(d.Text) })
+	_, err := f.gen.GenerateDrafts(t.Context(), exampleBrief, "", func(d Delta) { forwarded += len(d.Text) })
 	requireCode(t, err, CodeInvalidOutput)
 	if forwarded > MaxDraftsOutputBytes {
 		t.Errorf("forwarded %d bytes of deltas, cap is %d", forwarded, MaxDraftsOutputBytes)
@@ -470,7 +470,7 @@ func TestGenerator_PromptInjection(t *testing.T) {
 		} else if _, perr := segment.Parse(mustJSON(t, seg.Rule)); perr != nil {
 			t.Errorf("brief %q: returned rule does not re-validate: %v", brief, perr)
 		}
-		if _, err := f.gen.GenerateDrafts(t.Context(), brief, nil); err != nil {
+		if _, err := f.gen.GenerateDrafts(t.Context(), brief, "", nil); err != nil {
 			t.Errorf("brief %q: drafts error = %v", brief, err)
 		}
 	}
@@ -514,7 +514,7 @@ func TestGenerator_InvalidBrief(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newFixture(t, nil)
 			_, err := f.gen.ProposeSegment(t.Context(), tt.brief)
-			_, derr := f.gen.GenerateDrafts(t.Context(), tt.brief, nil)
+			_, derr := f.gen.GenerateDrafts(t.Context(), tt.brief, "", nil)
 			if tt.ok {
 				if gerr, ok := errors.AsType[*Error](err); ok && gerr.Code == CodeInvalidBrief {
 					t.Errorf("ProposeSegment rejected a valid brief")
@@ -544,7 +544,7 @@ func TestGenerator_LogsNoBriefOrContent(t *testing.T) {
 	if _, err := f.gen.ProposeSegment(t.Context(), exampleBrief); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.gen.GenerateDrafts(t.Context(), exampleBrief, nil); err != nil {
+	if _, err := f.gen.GenerateDrafts(t.Context(), exampleBrief, "", nil); err != nil {
 		t.Fatal(err)
 	}
 

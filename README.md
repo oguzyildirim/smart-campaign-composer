@@ -5,12 +5,14 @@ audience segment and SMS/email drafts. A human reviews, edits, and approves,
 and approved messages go only to fake users through a local mock provider.
 **No real SMS or email is ever sent.**
 
-> **Status: Milestone 3 (AI campaign generation).** The stack starts with
-> ~5000 seeded fake users. A JSON segment rule can be validated and sized
-> per channel, and a natural-language brief (Turkish or English) becomes a
-> validated segment proposal with counts and validated SMS/email drafts,
-> using Claude or a deterministic mock. Campaign persistence, approval,
-> delivery, and the dashboard are not implemented yet.
+> **Status: Milestone 4 (campaign approval and content).** The stack starts
+> with ~5000 seeded fake users. In the browser, a marketer writes a brief
+> (Turkish or English), sees the proposed audience with per-channel counts,
+> watches SMS and email drafts stream in, edits them, previews them
+> personalized for real (fake) recipients, and explicitly approves. Approval
+> is persisted and bound to exactly the reviewed content. Claude or a
+> deterministic mock does the AI work. Delivery and the dashboard are not
+> implemented yet: approval sends nothing.
 
 ## Requirements
 
@@ -117,38 +119,100 @@ bodies over 16 KB. A non-JSON `Content-Type` gets `415`. Server errors
 return a generic `500`. The same path works through the frontend origin
 (`http://localhost:5173/api/v1/...`).
 
-## AI generation
+## Campaign flow
 
-Two temporary endpoints turn a brief into proposals. The next milestone
-replaces them with campaign endpoints and streaming:
+Open http://localhost:5173, choose **New campaign**, and paste the example
+brief:
 
-- `POST /api/v1/ai/segment` `{"brief": "..."}` → validated segment rule,
-  per-channel counts (same consent-aware counting as the preview), criteria
-  the rules cannot express, and a short explanation.
-- `POST /api/v1/ai/drafts` `{"brief": "..."}` → validated SMS and email
-  drafts plus their worst-case lengths.
+> Son 30 günde sepetine ürün ekleyip alışveriş yapmayan İstanbul'daki
+> kullanıcılara %30 indirim hatırlatması gönder. Samimi ama kısa olsun.
 
-Example (mock mode, seeded data; output as observed):
+1. **Audience.** The AI proposes a segment rule; the backend validates it
+   and counts matching users and consented recipients per channel. Criteria
+   the rules cannot express are shown as a warning.
+2. **Drafts.** *Generate SMS and email drafts* streams the text field by
+   field. Partial text is display-only; drafts are stored only after they
+   pass validation. Closing the tab cancels the model call.
+3. **Edit and preview.** Edits autosave. The preview renders each selected
+   channel's content for sample recipients, including the one with the
+   longest first name, and shows final lengths after personalization and
+   every problem approval would reject.
+4. **Approve.** *Approve…* asks for your name and approves exactly the
+   version and content hash you reviewed. The campaign is then read-only.
+   Approval creates no delivery records or messages in this milestone.
+
+Statuses: `draft → audience_ready → drafts_ready → approved`. The backend
+owns them; the UI only displays them.
+
+### Endpoints
+
+| Method and path | Purpose |
+| --------------- | ------- |
+| `POST /api/v1/campaigns` `{"brief"}` | Create: AI segment extraction, validation, counts → `201`, `audience_ready` |
+| `GET /api/v1/campaigns` | The 100 most recent campaigns |
+| `GET /api/v1/campaigns/{id}` | One campaign, with `validation` once drafts exist |
+| `POST /api/v1/campaigns/{id}/drafts` | Generate drafts as Server-Sent Events (see below) |
+| `PATCH /api/v1/campaigns/{id}` `{"version","channels","sms_body","email_subject","email_body"}` | Replace content and channels; all fields required |
+| `GET /api/v1/campaigns/{id}/preview` | Content rendered for up to 3 recipients per selected channel, final lengths, all approval checks |
+| `POST /api/v1/campaigns/{id}/approve` `{"version","content_hash","approved_by"}` | Explicit human approval |
+
+**Draft stream.** The response is `text/event-stream` on a POST, read with
+`fetch` (not `EventSource`, which would reconnect and silently start another
+paid model call). Events: `delta` `{"attempt","field","text"}` with `field`
+one of `sms_body`, `email_subject`, `email_body` (a new `attempt` means a
+repair call started; discard earlier text); then `done`
+`{"status","drafts","validation","version","content_hash"}` or `error`
+`{"code","message"}`. Heartbeat comments arrive every 15 s. Only one
+generation runs per campaign (`409 generation_in_progress` otherwise).
+
+**Edits** must be structurally sound (known channels; UTF-8 without NUL;
+at most twice each field's limit), or they get `400`. Content that breaks
+a content rule (over a limit, unknown variable, HTML, empty) is saved and
+reported in `validation`, so work in progress is never lost. Approval
+rejects it. An edit that changes nothing does not bump the version.
+
+**Approval** runs in one transaction. It checks the state, `version`, and
+`content_hash`, then re-validates the segment rule and content. It then
+checks every limit against the longest real `first_name` and `city` among
+each selected channel's consented recipients, and requires at least one
+recipient. Approving an approved campaign with the same hash returns `200`
+unchanged with no second audit event; a different hash returns `409`.
+`approved_by` is free text: there is no authentication.
+
+Example (mock mode, seeded data; output as observed, shortened):
 
 ```bash
 BRIEF='{"brief":"Son 30 günde sepetine ürün ekleyip alışveriş yapmayan İstanbul'"'"'daki kullanıcılara %30 indirim hatırlatması gönder. Samimi ama kısa olsun."}'
-curl -s -H 'Content-Type: application/json' -d "$BRIEF" localhost:8080/api/v1/ai/segment
-# {"rule":{"version":1,"conditions":[{"field":"city","op":"eq","value":"İstanbul"},
-#   {"field":"added_to_cart_within_days","op":"eq","value":30},
-#   {"field":"no_purchase_within_days","op":"eq","value":30}]},
-#  "counts":{"total":389,"sms":262,"email":246},"unsupported_criteria":[],
-#  "explanation":"Users matching: city İstanbul; added to cart within 30 days; no purchase within 30 days."}
-curl -s -H 'Content-Type: application/json' -d "$BRIEF" localhost:8080/api/v1/ai/drafts
-# {"drafts":{"sms":{"body":"Merhaba {{first_name}}, sepetindeki ürünler seni bekliyor! %30 indirimle bugün tamamla."},
-#   "email":{"subject":"{{first_name}}, sepetin seni bekliyor - %30 indirim","body":"Merhaba {{first_name}},\n\n..."}},
-#  "worst_case_lengths":{"sms_body":103,"email_subject":67,"email_body":181}}
+ID=$(curl -s -H 'Content-Type: application/json' -d "$BRIEF" localhost:8080/api/v1/campaigns | jq -r .id)
+# status audience_ready, counts {"total":389,"sms":262,"email":246}
+curl -sN -X POST localhost:8080/api/v1/campaigns/$ID/drafts
+# event: delta
+# data: {"attempt":1,"field":"sms_body","text":"Merhaba "}
+# ...
+# event: done
+# data: {"status":"drafts_ready","drafts":{"sms_body":"Merhaba {{first_name}}, sepetindeki ürünler seni bekliyor! %30 indirimle bugün tamamla.",...},"version":2,...}
+curl -s localhost:8080/api/v1/campaigns/$ID/preview | jq '.channels[0].samples[0].fields[0]'
+# {"field":"sms.body","text":"Merhaba Alexandria Elizabeth Josephine, sepetindeki ürünler seni bekliyor! %30 indirimle bugün tamamla.",
+#  "length":103,"limit":160,"over_limit":false}
+HASH=$(curl -s localhost:8080/api/v1/campaigns/$ID | jq -r .content_hash)
+curl -s -H 'Content-Type: application/json' \
+  -d "{\"version\":1,\"content_hash\":\"$HASH\",\"approved_by\":\"Deniz\"}" localhost:8080/api/v1/campaigns/$ID/approve
+# {"error":"the campaign was changed by someone else; reload it","code":"version_conflict"}   (stale version → 409)
+```
+
+The audit log is in `campaign_events` (action, actor, from → to status,
+version). It never holds content or recipient data:
+
+```bash
+docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT action, actor, from_status, to_status, version FROM campaign_events ORDER BY id"'
 ```
 
 **Mock vs real mode.** With `ANTHROPIC_API_KEY` empty (or
 `LLM_PROVIDER=mock`), a keyword-based mock answers. It recognizes the
 example brief's city, cart, and no-purchase phrases, a few others
 (Turkish and English), and age/gender/income/birthday as unsupported. It
-returns fixed Turkish or English drafts. With a key set, the API calls
+returns fixed Turkish or English drafts, streamed in chunks paced by
+`LLM_MOCK_STREAM_DELAY` so the UI shows them arriving. With a key set, the API calls
 Claude (`ANTHROPIC_MODEL`, default `claude-sonnet-5-5`); restart the API
 after changing `.env` (`docker compose up -d api`). The startup log line
 shows `llm_provider` and `llm_model`, never the key.
@@ -170,12 +234,22 @@ returned:
 | Status | `code`                 | Meaning                                                   |
 | ------ | ---------------------- | --------------------------------------------------------- |
 | 400    | `invalid_brief`        | Empty, longer than 1000 characters, or control characters |
-| 400/415| `invalid_request`      | Malformed or oversized body, unknown fields, wrong type   |
+| 400/415| `invalid_request`      | Malformed or oversized body, unknown or missing fields, wrong type; `details` lists field problems |
+| 404    | `not_found`            | No campaign with that id (also for ids that are not UUIDs) |
+| 409    | `invalid_state`        | The status does not allow the action (e.g. editing an approved campaign) |
+| 409    | `version_conflict`     | The campaign changed since it was read                    |
+| 409    | `content_changed`      | The content hash does not match the stored content        |
+| 409    | `generation_in_progress` | Drafts are being generated for the campaign             |
+| 422    | `invalid_content`      | Approval: content fails validation, including for the real audience; `details` lists fields |
+| 422    | `no_recipients`        | Approval: no selected channel has a consented recipient   |
 | 422    | `unsupported_brief`    | Only unsupported criteria; `unsupported_criteria` lists them |
 | 422    | `refused`              | The model declined the brief                              |
 | 502    | `invalid_output`       | Output failed validation on every attempt                 |
 | 503    | `upstream_unavailable` | Provider error (429/5xx/network) after SDK retries        |
 | 504    | `timeout`              | The model did not answer within the call timeout          |
+
+During draft generation, errors after the stream started arrive as an
+`error` event with the same codes.
 
 SMS length is counted in characters (runes), as the specification asks.
 Real networks count differently: any character outside the GSM-7 alphabet
@@ -201,6 +275,8 @@ Single tests:
 go test ./internal/health/... -run TestReadinessHandler
 go test ./internal/segment/... -run TestParse_Rejections
 go test ./internal/campaign/... -run TestGenerator_ProposeSegment_InvalidOutput
+go test ./internal/campaign/... -run TestApprove_Rejections
+go test ./internal/httpapi/... -run TestDraftStream
 go test -tags=integration ./internal/platform/postgres/...   # Docker required
 cd frontend && npm test
 ```
@@ -230,6 +306,7 @@ Compose builds the service configuration from `.env` (see `.env.example`).
 | `LLM_SEGMENT_TIMEOUT`, `LLM_DRAFTS_TIMEOUT` | api | `20s`, `60s` | Per model call, including SDK retries (max `3m`) |
 | `LLM_MAX_ATTEMPTS`   | api                | `2`      | Calls per request incl. repair attempts (1–3)     |
 | `LLM_SDK_MAX_RETRIES`| api                | `2`      | SDK retries for 429/5xx/connection errors (0–5)   |
+| `LLM_MOCK_STREAM_DELAY` | api             | `40ms`   | Pause between the mock's streamed chunks (max `1s`) |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | compose | — | Required; local-only credentials, URL-safe characters |
 | `LOG_LEVEL`          | all                | `info`   | `debug`, `info`, `warn`, `error`                  |
 | `SHUTDOWN_TIMEOUT`   | all                | `10s`    | Graceful shutdown bound, max `60s`                |
@@ -240,8 +317,9 @@ Compose builds the service configuration from `.env` (see `.env.example`).
 Set inside `docker-compose.yml`, so not needed in `.env`: `DATABASE_URL`,
 `KAFKA_BROKERS`, `API_HTTP_ADDR`, `WORKER_HEALTH_ADDR`, `MOCK_PROVIDER_ADDR`,
 `READINESS_TIMEOUT` (default `2s`), and `HTTP_REQUEST_TIMEOUT` (default
-`30s`; the AI routes instead get `LLM_MAX_ATTEMPTS ×` the longer LLM
-timeout plus 5 s).
+`30s`; campaign creation instead gets `LLM_MAX_ATTEMPTS ×` the longer LLM
+timeout plus 5 s, and the draft stream has no request timeout but the same
+bound on the generation itself).
 Invalid values stop the process at startup with a message naming every bad
 variable. Secret values are never echoed.
 
@@ -262,23 +340,28 @@ internal/
   config           env loading + validation, redacting Secret type
   health           liveness/readiness handlers, concurrent checks
   segment          rule DSL: strict parser/validator, SQL compiler, preview service
-  campaign         AI generation: brief validation, output decoding, repair loop, error codes
+  campaign         state machine, edits, generation lease, preview, approval (Service);
+                   AI generation: brief validation, output decoding, repair loop (Generator)
+  campaign/campaigntest  in-memory Store and AudienceInspector fakes for unit tests
   content          drafts, {{variable}} templates, channel limits, plain-text checks
   llm              LLM port (interface, request types, errors)
   llm/mockllm      deterministic keyword mock with scripted test faults
   strictjson       strict JSON decoding (duplicate keys, unknown fields, trailing data)
   seed             deterministic fake-data generator + transactional loader
-  httpapi          /api/v1 handlers (segment preview, AI segment/drafts)
+  httpapi          /api/v1 handlers (segment preview, campaigns, SSE draft stream)
   worker           worker lifecycle
   platform/
     httpserver     server timeouts, middleware, graceful shutdown, probe client
     logging        slog JSON logger
-    postgres       pgx pool, health checker, audience repository (consent filter)
+    postgres       pgx pool, health checker, audience repository (consent filter),
+                   campaign store (row lock + version check, audit events)
     kafka          franz-go client + health checker
     claude         Claude API adapter (anthropic-sdk-go, structured outputs, streaming)
   testutil/pgtest  testcontainers Postgres + migrations (integration tag)
 migrations/        versioned SQL (golang-migrate)
-frontend/          Vue 3 + TypeScript (strict) + Vite, Vitest, ESLint
+frontend/          Vue 3 + TypeScript (strict) + Vite + vue-router, Vitest, ESLint
+  src/api          typed client, runtime response guards, fetch-based SSE reader
+  src/views        campaign list, new campaign, review (stream, edit, preview, approve)
 ```
 
 Dependencies flow inward. Entry points wire the platform adapters. The
@@ -297,7 +380,8 @@ behind each choice.
   running Docker daemon. On WSL 2, enable *Docker Desktop → Settings →
   Resources → WSL integration* for your distro. `make test-unit` works
   without Docker.
-- **AI endpoints return `502 invalid_output` or `503 upstream_unavailable`**:
+- **Campaign creation or the draft stream returns `502 invalid_output` or
+  `503 upstream_unavailable`**:
   `docker compose logs api | grep "llm attempt"` shows each attempt's
   outcome and the validation problems. Briefs and generated text are never
   logged. `LLM_PROVIDER: claude requires ANTHROPIC_API_KEY` at startup
@@ -314,17 +398,28 @@ behind each choice.
   `no_purchase_within_days: 30`) are valid and count 0.
 - The seed only fills an empty database. Changing `SEED_USER_COUNT` later
   requires removing the Postgres volume.
-- Preview returns counts only, not recipient lists.
+- Segment preview returns counts only, not recipient lists. The campaign
+  preview shows first name and city of up to 3 fake recipients per channel,
+  never contact details.
 - The mock LLM is keyword based: it understands the example brief and
   some variations, not arbitrary briefs.
-- The AI endpoints are temporary and return JSON only. Draft streaming
-  (SSE), persistence, editing, and approval come in Milestone 4. Nothing
-  generated is stored.
-- Draft limits are checked against fixed worst-case variable lengths
-  (first name 30, city 20), not yet against the real audience.
+- There is no authentication. `approved_by` is a free-text name, and edits
+  are attributed to "marketer". Anyone who can reach the API can approve.
+- The segment rule cannot be edited by hand. To change the audience, edit
+  the brief and create a new campaign.
+- Generating drafts again replaces the current drafts, including edits.
+  The UI only offers generation before the first drafts exist.
+- Content limits are checked twice: against fixed worst-case variable
+  lengths (first name 30, city 20) and, at approval, against the longest
+  real values in the audience. Per-recipient rendering right before
+  delivery comes with Milestone 5.
+- Audience counts are a snapshot taken at creation. Approval re-checks the
+  live audience, but the stored counts are not refreshed.
+- If an API process dies mid-generation, the campaign's generation lease
+  blocks a new generation until it expires (generation timeout + 15 s).
 - SMS limits count characters, not GSM-7/UCS-2 segments (see above).
 
 ## Not yet implemented
 
-Everything after Milestone 3: campaign persistence, draft streaming,
-the approval UI, queueing and delivery, metrics, and the live dashboard.
+Everything after Milestone 4: delivery records, queueing and sending
+through the mock provider, metrics, and the live dashboard.

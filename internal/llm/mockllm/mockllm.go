@@ -18,6 +18,7 @@ import (
 	"iter"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/oguzyildirim/smart-campaign-composer/internal/content"
@@ -70,6 +71,7 @@ type Client struct {
 	mu     sync.Mutex
 	script []Step
 	calls  []Call
+	delay  time.Duration
 }
 
 var _ llm.Client = (*Client)(nil)
@@ -78,6 +80,14 @@ var _ llm.Client = (*Client)(nil)
 // across both operations, then behaves normally.
 func New(script ...Step) *Client {
 	return &Client{script: script}
+}
+
+// WithStreamDelay makes GenerateDrafts pause d between streamed chunks,
+// so a UI shows drafts arriving the way a real model streams them. It
+// returns c and must be called before c is used.
+func (c *Client) WithStreamDelay(d time.Duration) *Client {
+	c.delay = d
+	return c
 }
 
 // Calls returns the calls made so far.
@@ -122,7 +132,14 @@ func (c *Client) GenerateDrafts(ctx context.Context, req llm.DraftRequest, onDel
 	if err != nil {
 		return "", err
 	}
+	first := true
 	for chunk := range chunks(out, ChunkRunes) {
+		if !first {
+			if err := c.pause(ctx); err != nil {
+				return "", fmt.Errorf("mock generate drafts: %w", err)
+			}
+		}
+		first = false
 		if err := ctx.Err(); err != nil {
 			return "", fmt.Errorf("mock generate drafts: %w", err)
 		}
@@ -131,6 +148,21 @@ func (c *Client) GenerateDrafts(ctx context.Context, req llm.DraftRequest, onDel
 		}
 	}
 	return out, nil
+}
+
+// pause waits the stream delay or until ctx ends.
+func (c *Client) pause(ctx context.Context) error {
+	if c.delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(c.delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // apply resolves a scripted step. done is false when the call should

@@ -1,13 +1,20 @@
-// Package campaign holds the campaign domain. This milestone covers AI
-// generation: turning a marketer's brief into a validated segment proposal
-// and validated message drafts. Model output is untrusted; it is decoded
+// Package campaign holds the campaign domain: the lifecycle state machine,
+// editing, and human approval (Service), and AI generation (Generator),
+// which turns a marketer's brief into a validated segment proposal and
+// validated message drafts. Model output is untrusted; it is decoded
 // strictly, validated by the segment and content packages, and repaired at
-// most a bounded number of times.
+// most a bounded number of times. Nothing the model returns can change a
+// campaign's status beyond storing validated drafts; only Service.Approve
+// approves, on an explicit human request.
 //
 // The package has no HTTP, SQL, or LLM SDK dependencies.
 package campaign
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/oguzyildirim/smart-campaign-composer/internal/content"
+)
 
 // ErrorCode is a stable, client-safe error category.
 type ErrorCode string
@@ -30,15 +37,40 @@ const (
 	CodeUpstreamUnavailable ErrorCode = "upstream_unavailable"
 )
 
-// Error is a generation failure. Message and UnsupportedCriteria are safe
-// to return to clients; Err holds internal detail for logs only.
+// Campaign lifecycle error codes.
+const (
+	// CodeInvalidRequest: a request is structurally invalid (see Details).
+	CodeInvalidRequest ErrorCode = "invalid_request"
+	// CodeNotFound: no campaign has the given id.
+	CodeNotFound ErrorCode = "not_found"
+	// CodeInvalidState: the campaign's status does not allow the action.
+	CodeInvalidState ErrorCode = "invalid_state"
+	// CodeVersionConflict: the campaign changed since the client read it.
+	CodeVersionConflict ErrorCode = "version_conflict"
+	// CodeContentChanged: the content hash the client reviewed does not
+	// match the stored content.
+	CodeContentChanged ErrorCode = "content_changed"
+	// CodeGenerationInProgress: drafts are being generated for the campaign.
+	CodeGenerationInProgress ErrorCode = "generation_in_progress"
+	// CodeInvalidContent: the content fails validation (see Details).
+	CodeInvalidContent ErrorCode = "invalid_content"
+	// CodeNoRecipients: no selected channel has a consented recipient.
+	CodeNoRecipients ErrorCode = "no_recipients"
+)
+
+// Error is a client-safe failure of generation or a lifecycle action.
+// Message, UnsupportedCriteria, and Details are safe to return to clients;
+// Err holds internal detail for logs only.
 type Error struct {
 	Code    ErrorCode
 	Message string
 	// UnsupportedCriteria lists criteria the model could not express, for
 	// CodeUnsupportedBrief. They are validated plain text.
 	UnsupportedCriteria []string
-	Err                 error
+	// Details lists field-level problems for CodeInvalidRequest and
+	// CodeInvalidContent. Messages never echo content.
+	Details []content.FieldError
+	Err     error
 }
 
 func (e *Error) Error() string {
@@ -61,4 +93,22 @@ var messages = map[ErrorCode]string{
 	CodeRefused:             "the AI declined to process this brief",
 	CodeTimeout:             "the AI did not respond in time",
 	CodeUpstreamUnavailable: "the AI service is temporarily unavailable",
+
+	CodeInvalidRequest:       "the request is invalid",
+	CodeNotFound:             "campaign not found",
+	CodeInvalidState:         "the campaign's status does not allow this action",
+	CodeVersionConflict:      "the campaign was changed by someone else; reload it",
+	CodeContentChanged:       "the content changed since it was reviewed; review it again",
+	CodeGenerationInProgress: "drafts are being generated for this campaign",
+	CodeInvalidContent:       "the content does not pass validation",
+	CodeNoRecipients:         "no selected channel has a recipient who gave consent",
+}
+
+// fail returns a client-safe *Error with code's default message, or msg
+// when given.
+func fail(code ErrorCode, msg string, details ...content.FieldError) *Error {
+	if msg == "" {
+		msg = messages[code]
+	}
+	return &Error{Code: code, Message: msg, Details: details}
 }

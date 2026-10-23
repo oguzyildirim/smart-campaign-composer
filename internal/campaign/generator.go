@@ -113,16 +113,18 @@ func (g *Generator) ProposeSegment(ctx context.Context, brief string) (SegmentPr
 }
 
 // GenerateDrafts asks the model for SMS and email drafts and validates
-// them. onDelta, if non-nil, receives raw output fragments as they stream;
+// them. audienceSummary, if non-empty, describes the audience in plain
+// words for tone; it is passed to the model as data. onDelta, if non-nil,
+// receives raw output fragments as they stream;
 // they are capped at MaxDraftsOutputBytes per attempt and are never
 // validated, so they must only be displayed.
-func (g *Generator) GenerateDrafts(ctx context.Context, brief string, onDelta func(Delta)) (DraftsResult, error) {
+func (g *Generator) GenerateDrafts(ctx context.Context, brief, audienceSummary string, onDelta func(Delta)) (DraftsResult, error) {
 	brief, err := ValidateBrief(brief)
 	if err != nil {
 		return DraftsResult{}, err
 	}
 	call := func(ctx context.Context, attempt int, repair *llm.Repair) (string, error) {
-		return g.llm.GenerateDrafts(ctx, llm.DraftRequest{Brief: brief, Repair: repair}, cappedDeltas(attempt, onDelta))
+		return g.llm.GenerateDrafts(ctx, llm.DraftRequest{Brief: brief, AudienceSummary: audienceSummary, Repair: repair}, cappedDeltas(attempt, onDelta))
 	}
 	validate := func(_ context.Context, raw string) (DraftsResult, []string, error) {
 		res, problems := decodeDrafts(raw)

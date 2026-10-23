@@ -32,6 +32,9 @@ const (
 	DefaultLLMDraftsTimeout  = 60 * time.Second
 	DefaultLLMMaxAttempts    = 2
 	DefaultLLMSDKMaxRetries  = 2
+	// DefaultLLMMockStreamDelay paces the mock's streamed chunks so the UI
+	// shows drafts arriving; about one second for the example drafts.
+	DefaultLLMMockStreamDelay = 40 * time.Millisecond
 
 	maxShutdownTimeout = 60 * time.Second
 	maxCheckTimeout    = 30 * time.Second
@@ -39,6 +42,7 @@ const (
 	maxLLMCallTimeout  = 3 * time.Minute
 	maxLLMAttempts     = 3
 	maxLLMSDKRetries   = 5
+	maxMockStreamDelay = time.Second
 	// llmRouteSlack is added to the LLM routes' timeout so the service's
 	// own per-call timeouts always fire first and produce a clean error.
 	llmRouteSlack = 5 * time.Second
@@ -91,6 +95,8 @@ type LLMConfig struct {
 	// SDKMaxRetries is the Claude SDK's retry count for transient HTTP
 	// errors within one call.
 	SDKMaxRetries int
+	// MockStreamDelay is the pause between the mock LLM's streamed chunks.
+	MockStreamDelay time.Duration
 }
 
 // RouteTimeout is the request timeout for routes that call the LLM: long
@@ -148,12 +154,13 @@ func Load(getenv Getenv) (Config, error) {
 		},
 	}
 	cfg.LLM = LLMConfig{
-		Provider:       p.llmProvider("LLM_PROVIDER", cfg.AnthropicAPIKey.IsSet()),
-		Model:          p.model("ANTHROPIC_MODEL", DefaultAnthropicModel),
-		SegmentTimeout: p.duration("LLM_SEGMENT_TIMEOUT", DefaultLLMSegmentTimeout, maxLLMCallTimeout),
-		DraftsTimeout:  p.duration("LLM_DRAFTS_TIMEOUT", DefaultLLMDraftsTimeout, maxLLMCallTimeout),
-		MaxAttempts:    p.intRange("LLM_MAX_ATTEMPTS", DefaultLLMMaxAttempts, 1, maxLLMAttempts),
-		SDKMaxRetries:  p.intRange("LLM_SDK_MAX_RETRIES", DefaultLLMSDKMaxRetries, 0, maxLLMSDKRetries),
+		Provider:        p.llmProvider("LLM_PROVIDER", cfg.AnthropicAPIKey.IsSet()),
+		Model:           p.model("ANTHROPIC_MODEL", DefaultAnthropicModel),
+		SegmentTimeout:  p.duration("LLM_SEGMENT_TIMEOUT", DefaultLLMSegmentTimeout, maxLLMCallTimeout),
+		DraftsTimeout:   p.duration("LLM_DRAFTS_TIMEOUT", DefaultLLMDraftsTimeout, maxLLMCallTimeout),
+		MaxAttempts:     p.intRange("LLM_MAX_ATTEMPTS", DefaultLLMMaxAttempts, 1, maxLLMAttempts),
+		SDKMaxRetries:   p.intRange("LLM_SDK_MAX_RETRIES", DefaultLLMSDKMaxRetries, 0, maxLLMSDKRetries),
+		MockStreamDelay: p.duration("LLM_MOCK_STREAM_DELAY", DefaultLLMMockStreamDelay, maxMockStreamDelay),
 	}
 
 	if err := p.err(); err != nil {

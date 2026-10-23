@@ -15,7 +15,7 @@ const (
 )
 
 // readJSONBody reads a JSON request body of at most limit bytes. On
-// failure it returns the status and a client-safe message.
+// failure, it returns the status and a client-safe message.
 func readJSONBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, int, string) {
 	if mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mediaType != "application/json" {
 		return nil, http.StatusUnsupportedMediaType, msgUnsupportedMediaType
