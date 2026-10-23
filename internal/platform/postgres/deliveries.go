@@ -225,6 +225,16 @@ func (s *DeliveryStore) CompleteFinishedCampaigns(ctx context.Context) (int, err
 	return int(tag.RowsAffected()), nil
 }
 
+// PendingOutbox implements delivery.Maintenance. It uses
+// outbox_unpublished_idx.
+func (s *DeliveryStore) PendingOutbox(ctx context.Context) (int, error) {
+	var n int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE published_at IS NULL`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count pending outbox: %w", err)
+	}
+	return n, nil
+}
+
 // PurgePublishedOutbox implements delivery.Maintenance.
 func (s *DeliveryStore) PurgePublishedOutbox(ctx context.Context, olderThan time.Duration) (int, error) {
 	tag, err := s.pool.Exec(ctx, `DELETE FROM outbox

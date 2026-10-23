@@ -7,6 +7,9 @@
 //
 //	mock-provider                    run the server
 //	mock-provider healthcheck URL    exit 0 if URL returns 200
+//
+// It serves /healthz and /readyz; with no dependencies, ready means
+// serving.
 package main
 
 import (
@@ -18,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/oguzyildirim/smart-campaign-composer/internal/config"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/health"
@@ -78,8 +82,8 @@ func run(ctx context.Context) error {
 
 	// No router-wide timeout: a "lost response" deliberately stalls longer
 	// than clients wait.
-	router := httpserver.NewRouter(logger, 0)
-	router.Get("/healthz", health.LivenessHandler())
+	// It has no dependencies, so ready means serving.
+	router := httpserver.ProbeRouter(logger, health.NewReadiness(nil, time.Second, logger), nil)
 	router.Handle("/v1/*", mockprovider.New(faults, logger).Handler())
 
 	srv := httpserver.New(cfg.Addr, router, logger)

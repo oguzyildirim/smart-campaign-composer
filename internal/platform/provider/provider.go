@@ -27,11 +27,30 @@ const MaxRetryAfter = time.Hour
 // maxResponseBytes bounds how much of a response is read.
 const maxResponseBytes = 64 << 10
 
+// Observer receives every provider request's outcome. codeClass is one
+// of the CodeClass values; implementations may use it as a label.
+type Observer interface {
+	ProviderRequest(c content.Channel, codeClass string, d time.Duration)
+}
+
+// Code classes reported to the Observer: the response status class, 429
+// on its own (it drives the rate-limit handling), or "error" when no
+// response arrived (timeout, connection failure).
+const (
+	CodeClass2xx   = "2xx"
+	CodeClass3xx   = "3xx"
+	CodeClass429   = "429"
+	CodeClass4xx   = "4xx"
+	CodeClass5xx   = "5xx"
+	CodeClassError = "error"
+)
+
 // Client sends messages to the provider. It implements delivery.Provider.
 type Client struct {
-	base *url.URL
-	http *http.Client
-	now  func() time.Time
+	base     *url.URL
+	http     *http.Client
+	now      func() time.Time
+	observer Observer
 }
 
 var _ delivery.Provider = (*Client)(nil)
@@ -44,6 +63,34 @@ func New(baseURL string, timeout time.Duration) (*Client, error) {
 		return nil, errors.New("provider URL must be http(s)://host[:port] without credentials")
 	}
 	return &Client{base: u, http: &http.Client{Timeout: timeout}, now: time.Now}, nil
+}
+
+// WithObserver reports each request to o and returns c.
+func (c *Client) WithObserver(o Observer) *Client {
+	c.observer = o
+	return c
+}
+
+func (c *Client) observe(ch content.Channel, codeClass string, start time.Time) {
+	if c.observer != nil {
+		c.observer.ProviderRequest(ch, codeClass, time.Since(start))
+	}
+}
+
+// codeClass maps an HTTP status to its CodeClass.
+func codeClass(status int) string {
+	switch {
+	case status == http.StatusTooManyRequests:
+		return CodeClass429
+	case status >= 500:
+		return CodeClass5xx
+	case status >= 400:
+		return CodeClass4xx
+	case status >= 300:
+		return CodeClass3xx
+	default:
+		return CodeClass2xx
+	}
 }
 
 type smsRequest struct {
@@ -87,8 +134,10 @@ func (c *Client) Send(ctx context.Context, msg delivery.Message) (string, error)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Idempotency-Key", string(msg.IdempotencyKey))
 
+	start := time.Now()
 	resp, err := c.http.Do(req)
 	if err != nil {
+		c.observe(msg.Channel, CodeClassError, start)
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
@@ -99,12 +148,14 @@ func (c *Client) Send(ctx context.Context, msg delivery.Message) (string, error)
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
+		c.observe(msg.Channel, CodeClassError, start)
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
 		return "", &delivery.ProviderError{Code: delivery.CodeTimeout, Transient: true, Err: err}
 	}
 
+	c.observe(msg.Channel, codeClass(resp.StatusCode), start)
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		var r sendResponse
 		if err := json.Unmarshal(data, &r); err != nil || r.MessageID == "" || len(r.MessageID) > 128 {

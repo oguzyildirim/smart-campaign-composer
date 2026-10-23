@@ -66,6 +66,8 @@ not `./...`: `frontend/node_modules` contains stray `.go` files.
   consent/render, send, record), retry policy, shared-bucket limiter,
   outbox relay and maintenance loops; `Store`/`Provider`/`RateLimiter`/
   `Outbox`/`Publisher` ports.
+- `internal/monitoring` — domain: campaign progress read model (snapshot,
+  `Source` port, `Hub` with one shared poller per campaign).
 - `internal/mockprovider` — the mock provider's HTTP API: idempotency,
   fake-recipient guard, deterministic fault injection, stats.
 - `internal/llm` — LLM port (interface, request types, errors);
@@ -73,10 +75,13 @@ not `./...`: `frontend/node_modules` contains stray `.go` files.
 - `internal/strictjson` — strict JSON decoding for untrusted input.
 - `internal/seed` — deterministic fake-data generator and transactional loader.
 - `internal/httpapi` — `/api/v1` HTTP handlers (segment preview, campaigns,
-  SSE draft stream); map domain errors to status codes.
-- `internal/platform/` — infrastructure adapters: `httpserver`, `logging`,
+  SSE draft stream, progress JSON + SSE); map domain errors to status codes.
+- `internal/platform/` — infrastructure adapters: `httpserver` (incl. probe
+  router), `logging`, `metrics` (Prometheus registry, HTTP middleware,
+  delivery/LLM adapters),
   `postgres` (pool, health, audience repository with consent filter,
-  campaign store, delivery store with claim/lease and outbox, token bucket),
+  campaign store, delivery store with claim/lease and outbox, token bucket,
+  progress repository),
   `kafka` (client, topic setup, publisher, consumer group),
   `provider` (HTTP client for the mock provider), `claude` (Claude API
   adapter). Domain packages live under `internal/` and must not import
@@ -86,7 +91,8 @@ not `./...`: `frontend/node_modules` contains stray `.go` files.
 - `migrations/` — versioned SQL migrations (golang-migrate).
 - `frontend/` — Vue 3 + TypeScript + Vite + vue-router application
   (Vitest, ESLint); `src/api` holds the typed API client, response guards,
-  and SSE reader; `src/views` the pages.
+  and SSE reader; `src/composables` shared state (draft stream, campaign
+  progress over EventSource); `src/views` the pages.
 - `ai-sessions/` — Claude session exports, written automatically by the
   `SessionEnd` hook; never hand-edited or mixed into source commits.
 

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
-import { listCampaigns, type CampaignSummary } from '../api/campaigns'
+import { isApproved, listCampaigns, type CampaignSummary } from '../api/campaigns'
 import StatusBadge from '../components/StatusBadge.vue'
 import { describeError, isAbort } from '../composables/errors'
 
@@ -73,6 +73,13 @@ function formatDate(iso: string): string {
           <StatusBadge :status="c.status" />
           <span class="muted">{{ c.counts.total }} users · SMS {{ c.counts.sms }} · email {{ c.counts.email }}</span>
           <span class="muted">{{ formatDate(c.createdAt) }}</span>
+          <RouterLink
+            v-if="isApproved(c.status)"
+            :to="`/campaigns/${c.id}/dashboard`"
+            :data-testid="`dashboard-${c.id}`"
+          >
+            Delivery dashboard
+          </RouterLink>
         </div>
       </li>
     </ul>

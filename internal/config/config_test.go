@@ -392,3 +392,41 @@ func TestSecret_IsRedactedEverywhere(t *testing.T) {
 		t.Errorf("Reveal() = %q", s.Reveal())
 	}
 }
+
+func TestLoad_Progress(t *testing.T) {
+	cfg, err := Load(envFrom(validEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := cfg.API.Progress; p.PollInterval != time.Second || p.MaxViewers != 20 || p.ThroughputWindow != 10*time.Second {
+		t.Errorf("progress defaults = %+v, want 1s poll, 20 viewers, 10s window", p)
+	}
+
+	vars := validEnv()
+	vars["PROGRESS_POLL_INTERVAL"], vars["PROGRESS_MAX_VIEWERS"], vars["PROGRESS_THROUGHPUT_WINDOW"] = "250ms", "3", "30s"
+	cfg, err = Load(envFrom(vars))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := cfg.API.Progress; p.PollInterval != 250*time.Millisecond || p.MaxViewers != 3 || p.ThroughputWindow != 30*time.Second {
+		t.Errorf("progress overrides = %+v", p)
+	}
+
+	for _, tt := range []struct{ key, value string }{
+		{"PROGRESS_POLL_INTERVAL", "50ms"},
+		{"PROGRESS_POLL_INTERVAL", "11s"},
+		{"PROGRESS_POLL_INTERVAL", "soon"},
+		{"PROGRESS_MAX_VIEWERS", "0"},
+		{"PROGRESS_MAX_VIEWERS", "1001"},
+		{"PROGRESS_THROUGHPUT_WINDOW", "0s"},
+		{"PROGRESS_THROUGHPUT_WINDOW", "6m"},
+	} {
+		t.Run(tt.key+"="+tt.value, func(t *testing.T) {
+			vars := validEnv()
+			vars[tt.key] = tt.value
+			if _, err := Load(envFrom(vars)); err == nil || !strings.Contains(err.Error(), tt.key) {
+				t.Errorf("Load() error = %v, want one mentioning %s", err, tt.key)
+			}
+		})
+	}
+}

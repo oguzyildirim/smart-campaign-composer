@@ -128,3 +128,86 @@ export function previewJSON(overrides: Record<string, unknown> = {}): Record<str
     ...overrides,
   }
 }
+
+// FakeEventSource stands in for the browser's EventSource. Tests drive it
+// with open(), emit(), and error(); instances lists every one created.
+export class FakeEventSource {
+  static readonly CONNECTING = 0
+  static readonly OPEN = 1
+  static readonly CLOSED = 2
+  static instances: FakeEventSource[] = []
+
+  readonly url: string
+  readyState = FakeEventSource.CONNECTING
+  onopen: ((ev: Event) => void) | null = null
+  onerror: ((ev: Event) => void) | null = null
+  private listeners = new Map<string, Set<(ev: MessageEvent) => void>>()
+
+  constructor(url: string | URL) {
+    this.url = url.toString()
+    FakeEventSource.instances.push(this)
+  }
+
+  addEventListener(name: string, fn: (ev: MessageEvent) => void) {
+    const set = this.listeners.get(name) ?? new Set()
+    set.add(fn)
+    this.listeners.set(name, set)
+  }
+
+  removeEventListener(name: string, fn: (ev: MessageEvent) => void) {
+    this.listeners.get(name)?.delete(fn)
+  }
+
+  close() {
+    this.readyState = FakeEventSource.CLOSED
+  }
+
+  get closed(): boolean {
+    return this.readyState === FakeEventSource.CLOSED
+  }
+
+  open() {
+    this.readyState = FakeEventSource.OPEN
+    this.onopen?.(new Event('open'))
+  }
+
+  emit(name: string, data: unknown, lastEventId = '') {
+    const ev = new MessageEvent(name, { data: typeof data === 'string' ? data : JSON.stringify(data), lastEventId })
+    this.listeners.get(name)?.forEach((fn) => fn(ev))
+  }
+
+  // error simulates a dropped connection; with retry the browser keeps
+  // reconnecting (CONNECTING), without it the source is closed for good.
+  error(retry: boolean) {
+    this.readyState = retry ? FakeEventSource.CONNECTING : FakeEventSource.CLOSED
+    this.onerror?.(new Event('error'))
+  }
+
+  static install() {
+    FakeEventSource.instances = []
+    vi.stubGlobal('EventSource', FakeEventSource)
+  }
+
+  static latest(): FakeEventSource {
+    const es = FakeEventSource.instances.at(-1)
+    if (!es) throw new Error('no EventSource was opened')
+    return es
+  }
+}
+
+export function progressJSON(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    campaign_id: CAMPAIGN_ID,
+    campaign_status: 'sending',
+    channels: [
+      { channel: 'sms', queued: 100, processing: 10, sent: 140, failed: 2, retrying: 10, total: 262, sent_recently: 90, percent_done: 54.2 },
+      { channel: 'email', queued: 120, processing: 6, sent: 110, failed: 4, retrying: 6, total: 246, sent_recently: 60, percent_done: 46.34 },
+    ],
+    totals: { queued: 220, processing: 16, sent: 250, failed: 6, retrying: 16, total: 508 },
+    percent_done: 50.39,
+    failures: [{ code: 'provider_rejected', count: 5 }, { code: 'consent_revoked', count: 1 }],
+    throughput: { window_seconds: 10, sent: 150, per_second: 15 },
+    generated_at: '2026-10-24T09:30:00Z',
+    ...overrides,
+  }
+}

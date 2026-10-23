@@ -27,6 +27,7 @@ import (
 	"github.com/oguzyildirim/smart-campaign-composer/internal/platform/httpserver"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/platform/kafka"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/platform/logging"
+	"github.com/oguzyildirim/smart-campaign-composer/internal/platform/metrics"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/platform/postgres"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/platform/provider"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/worker"
@@ -83,18 +84,23 @@ func run(ctx context.Context) error {
 	}
 	defer producer.Close()
 
+	registry := metrics.NewRegistry()
+	deliveryMetrics := metrics.NewDelivery(registry)
+
 	topics := []string{delivery.Topic(content.ChannelSMS), delivery.Topic(content.ChannelEmail)}
 	store := postgres.NewDeliveryStore(pool)
 	sender, err := provider.New(d.ProviderURL, d.ProviderTimeout)
 	if err != nil {
 		return err
 	}
+	sender.WithObserver(deliveryMetrics)
 	processor := delivery.NewProcessor(store,
 		delivery.NewLimiter(postgres.NewTokenBucket(pool, d.RateLimitPerSecond, d.RateLimitBurst)),
 		sender,
 		delivery.ProcessorConfig{
-			Lease:  d.Lease,
-			Policy: delivery.RetryPolicy{BaseDelay: d.RetryBaseDelay, Factor: d.RetryBackoffFactor, MaxDelay: d.RetryMaxDelay},
+			Lease:   d.Lease,
+			Policy:  delivery.RetryPolicy{BaseDelay: d.RetryBaseDelay, Factor: d.RetryBackoffFactor, MaxDelay: d.RetryMaxDelay},
+			Metrics: deliveryMetrics,
 		}, logger)
 	consumer, err := kafka.NewConsumer(kafka.ConsumerConfig{
 		Brokers:        cfg.KafkaBrokers,
@@ -116,10 +122,8 @@ func run(ctx context.Context) error {
 		"kafka":    kafka.NewChecker(producer),
 	}, cfg.ReadinessTimeout, logger)
 
-	// The worker serves only probes; it has no public API.
-	router := httpserver.NewRouter(logger, cfg.ReadinessTimeout*2)
-	router.Get("/healthz", health.LivenessHandler())
-	router.Get("/readyz", readiness.ReadinessHandler())
+	// The worker serves only probes and metrics; it has no public API.
+	router := httpserver.ProbeRouter(logger, readiness, metrics.Handler(registry))
 	srv := httpserver.New(cfg.Worker.HealthAddr, router, logger)
 
 	w := worker.New(readiness, logger, worker.Config{
@@ -135,6 +139,7 @@ func run(ctx context.Context) error {
 			{Name: "delivery maintenance", Run: func(ctx context.Context) error {
 				return delivery.RunMaintenance(ctx, store, delivery.MaintenanceConfig{
 					Interval: d.MaintenanceInterval, BatchSize: d.OutboxBatchSize, OutboxRetention: outboxRetention,
+					Metrics: deliveryMetrics,
 				}, logger)
 			}},
 		},

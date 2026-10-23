@@ -30,7 +30,21 @@ type GeneratorConfig struct {
 	// MaxAttempts is the total number of model calls per request: the
 	// first call plus repair calls after invalid output.
 	MaxAttempts int
+	// Metrics receives every model call's outcome; nil discards them.
+	Metrics LLMMetrics
 }
+
+// LLMMetrics receives model call outcomes for operational monitoring.
+// operation is extract_segment or generate_drafts; outcome is one of a
+// fixed set (ok, invalid_output, incomplete, cancelled, error, or an
+// ErrorCode), so implementations may use both as labels.
+type LLMMetrics interface {
+	LLMAttempt(operation, outcome string, d time.Duration)
+}
+
+type nopLLMMetrics struct{}
+
+func (nopLLMMetrics) LLMAttempt(string, string, time.Duration) {}
 
 // SegmentProposal is a validated segment rule with its audience size.
 type SegmentProposal struct {
@@ -69,6 +83,9 @@ type Generator struct {
 // NewGenerator returns a Generator. MaxAttempts below 1 is treated as 1.
 func NewGenerator(client llm.Client, segments SegmentPreviewer, cfg GeneratorConfig, logger *slog.Logger) *Generator {
 	cfg.MaxAttempts = max(cfg.MaxAttempts, 1)
+	if cfg.Metrics == nil {
+		cfg.Metrics = nopLLMMetrics{}
+	}
 	return &Generator{llm: client, segments: segments, cfg: cfg, logger: logger}
 }
 
@@ -231,9 +248,10 @@ func classifyCallError(ctx context.Context, op string, err error) (string, error
 	}
 }
 
-// logAttempt records one model call. It never logs the brief or the
+// logAttempt records one model call in the log and the metrics. It never logs the brief or the
 // model's output; problems are validator messages, which never echo it.
 func (g *Generator) logAttempt(ctx context.Context, op string, attempt int, start time.Time, outcome string, problems []string) {
+	g.cfg.Metrics.LLMAttempt(op, outcome, time.Since(start))
 	level := slog.LevelInfo
 	if outcome != "ok" {
 		level = slog.LevelWarn

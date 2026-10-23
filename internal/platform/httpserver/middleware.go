@@ -12,10 +12,11 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 )
 
-// quietPaths are probe endpoints polled every few seconds by Docker; their
-// access logs always go to debug level to keep the info stream useful.
+// quietPaths are probe and scrape endpoints polled every few seconds by
+// Docker or Prometheus; their access logs always go to debug level to keep
+// the info stream useful.
 // Failing dependency checks are logged separately by the health package.
-var quietPaths = map[string]bool{"/healthz": true, "/readyz": true}
+var quietPaths = map[string]bool{"/healthz": true, "/readyz": true, "/metrics": true}
 
 // NewRouter returns a chi router with the base middleware stack: request ID,
 // panic recovery, access logging, and a per-request timeout. A zero

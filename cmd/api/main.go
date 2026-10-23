@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -24,10 +25,12 @@ import (
 	"github.com/oguzyildirim/smart-campaign-composer/internal/httpapi"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/llm"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/llm/mockllm"
+	"github.com/oguzyildirim/smart-campaign-composer/internal/monitoring"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/platform/claude"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/platform/httpserver"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/platform/kafka"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/platform/logging"
+	"github.com/oguzyildirim/smart-campaign-composer/internal/platform/metrics"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/platform/postgres"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/segment"
 )
@@ -38,7 +41,8 @@ const (
 	// previewSamples is the number of recipients a preview renders per
 	// channel.
 	previewSamples = 3
-	// sseHeartbeat keeps idle proxies from closing a draft stream.
+	// sseHeartbeat keeps idle proxies from closing a draft or progress
+	// stream.
 	sseHeartbeat = 15 * time.Second
 )
 
@@ -90,25 +94,37 @@ func run(ctx context.Context) error {
 		"kafka":    kafka.NewChecker(kafkaClient),
 	}, cfg.ReadinessTimeout, logger)
 
+	registry := metrics.NewRegistry()
+	httpMetrics := metrics.NewHTTP(registry)
+
 	audience := postgres.NewAudienceRepository(pool)
 	segments := segment.NewService(audience, time.Now)
 	generator := campaign.NewGenerator(newLLMClient(cfg, logger), segments, campaign.GeneratorConfig{
 		SegmentTimeout: cfg.LLM.SegmentTimeout,
 		DraftsTimeout:  cfg.LLM.DraftsTimeout,
 		MaxAttempts:    cfg.LLM.MaxAttempts,
+		Metrics:        metrics.NewLLM(registry),
 	}, logger)
 	campaigns := campaign.NewService(generator, postgres.NewCampaignStore(pool), audience, campaign.ServiceConfig{
 		GenerationTimeout:   cfg.LLM.RouteTimeout(),
 		PreviewSamples:      previewSamples,
 		DeliveryMaxAttempts: cfg.Delivery.MaxAttempts,
 	}, time.Now, logger)
+	progress := monitoring.NewHub(postgres.NewProgressRepository(pool), monitoring.HubConfig{
+		Interval:   cfg.API.Progress.PollInterval,
+		Window:     cfg.API.Progress.ThroughputWindow,
+		MaxViewers: cfg.API.Progress.MaxViewers,
+	}, logger)
+	defer progress.Close()
 
 	// Timeouts are per route: LLM routes need room for every attempt, and
 	// the draft stream is bounded by the service's generation timeout.
 	router := httpserver.NewRouter(logger, 0)
+	router.Use(httpMetrics.Middleware)
 	defaultTimeout := middleware.Timeout(cfg.API.RequestTimeout)
 	router.With(defaultTimeout).Get("/healthz", health.LivenessHandler())
 	router.With(defaultTimeout).Get("/readyz", readiness.ReadinessHandler())
+	router.With(defaultTimeout).Method(http.MethodGet, "/metrics", metrics.Handler(registry))
 	router.Route("/api/v1", func(r chi.Router) {
 		r.Group(func(r chi.Router) {
 			r.Use(defaultTimeout)
@@ -121,9 +137,18 @@ func run(ctx context.Context) error {
 			CreateTimeout:  cfg.LLM.RouteTimeout(),
 			Heartbeat:      sseHeartbeat,
 		})
+		httpapi.MountProgress(r, httpapi.ProgressRoutes{
+			Service:        progress,
+			Logger:         logger,
+			RequestTimeout: cfg.API.RequestTimeout,
+			Heartbeat:      sseHeartbeat,
+		})
 	})
 
 	srv := httpserver.New(cfg.API.Addr, router, logger)
+	// Shutdown does not cancel request contexts; closing the hub ends the
+	// open progress streams so shutdown is not held up by them.
+	srv.RegisterOnShutdown(progress.Close)
 	return httpserver.Run(ctx, srv, cfg.ShutdownTimeout, logger)
 }
 

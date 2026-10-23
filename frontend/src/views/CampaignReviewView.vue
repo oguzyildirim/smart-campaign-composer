@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { RouterLink, useRouter } from 'vue-router'
 import {
   approveCampaign,
   editCampaign,
@@ -45,6 +46,7 @@ const dialogOpen = ref(false)
 const approving = ref(false)
 const approveError = ref('')
 
+const router = useRouter()
 const stream = useDraftStream()
 const controller = new AbortController()
 
@@ -181,6 +183,8 @@ async function approve(approvedBy: string) {
     campaign.value = approved
     syncForm(approved)
     dialogOpen.value = false
+    // Watch the delivery the approval just queued.
+    void router.push(`/campaigns/${props.id}/dashboard`)
   } catch (err) {
     if (isAbort(err)) return
     approveError.value = describeError(err)
@@ -237,6 +241,12 @@ function formatDate(iso: string | null): string {
     >
       Approved by {{ campaign.approvedBy }} on {{ formatDate(campaign.approvedAt) }}. This campaign can no longer be
       edited.
+      <RouterLink
+        :to="`/campaigns/${id}/dashboard`"
+        data-testid="dashboard-link"
+      >
+        View delivery dashboard
+      </RouterLink>
     </div>
 
     <AudiencePanel :audience="campaign.audience" />

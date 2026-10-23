@@ -124,6 +124,8 @@ func (m *fakeMaintenance) CompleteFinishedCampaigns(context.Context) (int, error
 	return 0, nil
 }
 
+func (m *fakeMaintenance) PendingOutbox(context.Context) (int, error) { return 0, nil }
+
 func (m *fakeMaintenance) PurgePublishedOutbox(context.Context, time.Duration) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -48,8 +48,14 @@ const (
 	DefaultRateLimitBurst       = 5
 	DefaultKafkaTopicPartitions = 6
 	DefaultOutboxPollInterval   = 200 * time.Millisecond
-	DefaultOutboxBatchSize      = 500
-	DefaultDeliveryScanInterval = time.Second
+	// Live progress: one shared poll per campaign and interval, whatever
+	// the number of viewers.
+	DefaultProgressPollInterval     = time.Second
+	DefaultProgressMaxViewers       = 20
+	DefaultProgressThroughputWindow = 10 * time.Second
+	minProgressPollInterval         = 100 * time.Millisecond
+	DefaultOutboxBatchSize          = 500
+	DefaultDeliveryScanInterval     = time.Second
 	// MaxSendsPerSecond is the product limit per channel. Rate plus burst
 	// may not exceed it: a token bucket admits at most rate + burst sends
 	// in any one-second window.
@@ -164,6 +170,18 @@ func (c LLMConfig) RouteTimeout() time.Duration {
 type APIConfig struct {
 	Addr           string
 	RequestTimeout time.Duration
+	Progress       ProgressConfig
+}
+
+// ProgressConfig configures the live campaign dashboard.
+type ProgressConfig struct {
+	// PollInterval is the time between two reads of one campaign's
+	// progress, shared by all of its viewers.
+	PollInterval time.Duration
+	// MaxViewers bounds the open progress streams per campaign.
+	MaxViewers int
+	// ThroughputWindow is the period the send rate is measured over.
+	ThroughputWindow time.Duration
 }
 
 // WorkerConfig holds settings used only by cmd/worker.
@@ -216,6 +234,11 @@ func Load(getenv Getenv) (Config, error) {
 		API: APIConfig{
 			Addr:           p.addr("API_HTTP_ADDR", DefaultAPIAddr),
 			RequestTimeout: p.duration("HTTP_REQUEST_TIMEOUT", DefaultRequestTimeout, maxRequestTimeout),
+			Progress: ProgressConfig{
+				PollInterval:     p.duration("PROGRESS_POLL_INTERVAL", DefaultProgressPollInterval, 10*time.Second),
+				MaxViewers:       p.intRange("PROGRESS_MAX_VIEWERS", DefaultProgressMaxViewers, 1, 1000),
+				ThroughputWindow: p.duration("PROGRESS_THROUGHPUT_WINDOW", DefaultProgressThroughputWindow, 5*time.Minute),
+			},
 		},
 		Worker: WorkerConfig{
 			HealthAddr: p.addr("WORKER_HEALTH_ADDR", DefaultWorkerHealthAddr),
@@ -236,6 +259,9 @@ func Load(getenv Getenv) (Config, error) {
 		OutboxPollInterval:  p.duration("OUTBOX_POLL_INTERVAL", DefaultOutboxPollInterval, 10*time.Second),
 		OutboxBatchSize:     p.intRange("OUTBOX_BATCH_SIZE", DefaultOutboxBatchSize, 1, 5000),
 		MaintenanceInterval: p.duration("DELIVERY_SCAN_INTERVAL", DefaultDeliveryScanInterval, time.Minute),
+	}
+	if cfg.API.Progress.PollInterval < minProgressPollInterval {
+		p.fail("PROGRESS_POLL_INTERVAL", "must be at least %s, got %s", minProgressPollInterval, cfg.API.Progress.PollInterval)
 	}
 	d := cfg.Delivery
 	if d.RateLimitPerSecond+d.RateLimitBurst > MaxSendsPerSecond {

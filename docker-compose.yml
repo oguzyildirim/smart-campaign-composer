@@ -119,6 +119,10 @@ services:
       LLM_MAX_ATTEMPTS: ${LLM_MAX_ATTEMPTS:-2}
       LLM_SDK_MAX_RETRIES: ${LLM_SDK_MAX_RETRIES:-2}
       LLM_MOCK_STREAM_DELAY: ${LLM_MOCK_STREAM_DELAY:-40ms}
+      # Live dashboard: one shared poll per campaign and interval.
+      PROGRESS_POLL_INTERVAL: ${PROGRESS_POLL_INTERVAL:-1s}
+      PROGRESS_MAX_VIEWERS: ${PROGRESS_MAX_VIEWERS:-20}
+      PROGRESS_THROUGHPUT_WINDOW: ${PROGRESS_THROUGHPUT_WINDOW:-10s}
     ports:
       - "127.0.0.1:${API_PORT:-8080}:8080"
     depends_on:
@@ -160,6 +164,10 @@ services:
       RATE_LIMIT_PER_SECOND: ${RATE_LIMIT_PER_SECOND:-90}
       RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-5}
       KAFKA_TOPIC_PARTITIONS: ${KAFKA_TOPIC_PARTITIONS:-6}
+    # /healthz, /readyz and /metrics on an ephemeral host port per replica
+    # (scaling-safe); find it with: docker compose port --index 1 worker 8081
+    ports:
+      - "127.0.0.1::8081"
     depends_on:
       postgres:
         condition: service_healthy
@@ -199,7 +207,7 @@ services:
     ports:
       - "127.0.0.1:${MOCK_PROVIDER_PORT:-9090}:9090"
     healthcheck:
-      test: ["CMD", "/app", "healthcheck", "http://127.0.0.1:9090/healthz"]
+      test: ["CMD", "/app", "healthcheck", "http://127.0.0.1:9090/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5

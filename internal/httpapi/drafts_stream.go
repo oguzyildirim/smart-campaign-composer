@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -145,6 +146,21 @@ func (s *sseWriter) event(name string, data any) error {
 		return fmt.Errorf("encode %s event: %w", name, err)
 	}
 	return s.write("event: " + name + "\ndata: " + string(payload) + "\n\n")
+}
+
+// eventWithID writes one event with an id, which EventSource clients send
+// back as Last-Event-ID when they reconnect.
+func (s *sseWriter) eventWithID(id uint64, name string, data any) error {
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("encode %s event: %w", name, err)
+	}
+	return s.write("id: " + strconv.FormatUint(id, 10) + "\nevent: " + name + "\ndata: " + string(payload) + "\n\n")
+}
+
+// retry tells EventSource clients how long to wait before reconnecting.
+func (s *sseWriter) retry(d time.Duration) error {
+	return s.write("retry: " + strconv.FormatInt(d.Milliseconds(), 10) + "\n\n")
 }
 
 // comment writes an SSE comment line, which clients ignore.

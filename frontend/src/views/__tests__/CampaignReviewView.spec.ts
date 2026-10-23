@@ -198,6 +198,8 @@ describe('CampaignReviewView', () => {
     expect(wrapper.find('[data-testid="approve"]').exists()).toBe(false)
     expect(wrapper.get('#field-sms_body').attributes('readonly')).toBeDefined()
     expect(wrapper.get('fieldset').attributes('disabled')).toBeDefined()
+    // A fresh approval goes on to the live dashboard.
+    expect(wrapper.vm.$router.currentRoute.value.fullPath).toBe(`/campaigns/${CAMPAIGN_ID}/dashboard`)
   })
 
   it('shows approval errors from the API and allows a retry', async () => {
@@ -229,6 +231,18 @@ describe('CampaignReviewView', () => {
     expect(wrapper.find('[data-testid="approve"]').exists()).toBe(false)
     expect(wrapper.find('[data-testid="generate"]').exists()).toBe(false)
     expect(wrapper.get('#field-email_subject').attributes('readonly')).toBeDefined()
+    // Reopening an approved campaign stays on the review page, with a link.
+    expect(wrapper.vm.$router.currentRoute.value.fullPath).toBe(`/campaigns/${CAMPAIGN_ID}`)
+    expect(wrapper.get('[data-testid="dashboard-link"]').attributes('href')).toBe(`/campaigns/${CAMPAIGN_ID}/dashboard`)
+  })
+
+  it('shows no dashboard link before approval', async () => {
+    stubFetch({
+      [`GET ${path}`]: () => jsonResponse(campaignJSON()),
+      [`GET ${path}/preview`]: () => jsonResponse(previewJSON()),
+    })
+    const wrapper = await mountView()
+    expect(wrapper.find('[data-testid="dashboard-link"]').exists()).toBe(false)
   })
 
   it.each(['sending', 'completed'] as const)('renders %s campaigns read-only with their status', async (status) => {

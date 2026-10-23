@@ -4,8 +4,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/go-chi/chi/v5"
+
+	"github.com/oguzyildirim/smart-campaign-composer/internal/health"
 )
 
 // probeTimeout bounds a container healthcheck request.
@@ -33,4 +38,18 @@ func Probe(ctx context.Context, url string) error {
 		return fmt.Errorf("probe %s: status %d", url, resp.StatusCode)
 	}
 	return nil
+}
+
+// ProbeRouter serves the operational endpoints of a binary without a
+// public API (worker, mock provider): /healthz, /readyz, and /metrics
+// when metrics is non-nil. Readiness bounds its own checks, so no request
+// timeout is applied.
+func ProbeRouter(logger *slog.Logger, readiness *health.Readiness, metrics http.Handler) chi.Router {
+	r := NewRouter(logger, 0)
+	r.Get("/healthz", health.LivenessHandler())
+	r.Get("/readyz", readiness.ReadinessHandler())
+	if metrics != nil {
+		r.Method(http.MethodGet, "/metrics", metrics)
+	}
+	return r
 }

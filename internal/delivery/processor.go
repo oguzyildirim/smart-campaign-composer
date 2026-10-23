@@ -26,6 +26,9 @@ type ProcessorConfig struct {
 	// Rand returns a number in [0, 1) for backoff jitter; nil uses
 	// math/rand/v2.
 	Rand func() float64
+	// Metrics receives attempt outcomes and rate-limit waits; nil
+	// discards them.
+	Metrics Metrics
 }
 
 // Processor performs delivery attempts. It is safe for concurrent use.
@@ -41,6 +44,9 @@ type Processor struct {
 func NewProcessor(store Store, limiter RateLimiter, provider Provider, cfg ProcessorConfig, logger *slog.Logger) *Processor {
 	if cfg.Rand == nil {
 		cfg.Rand = rand.Float64
+	}
+	if cfg.Metrics == nil {
+		cfg.Metrics = NopMetrics{}
 	}
 	return &Processor{store: store, limiter: limiter, provider: provider, cfg: cfg, logger: logger}
 }
@@ -71,6 +77,9 @@ func (p *Processor) Process(ctx context.Context, id ID) error {
 	if err != nil && !recorded {
 		return fmt.Errorf("record delivery outcome: %w", err)
 	}
+	if recorded {
+		p.cfg.Metrics.AttemptRecorded(job.Channel, o)
+	}
 	if err != nil {
 		// The outcome is stored; only the campaign completion check failed,
 		// and the maintenance sweep repeats it. Retrying the message would
@@ -97,12 +106,15 @@ func (p *Processor) Process(ctx context.Context, id ID) error {
 
 // attempt runs a claimed job up to and including the provider call.
 func (p *Processor) attempt(ctx context.Context, job Job) Outcome {
+	waitStart := time.Now()
 	if err := p.limiter.Wait(ctx, job.Channel); err != nil {
 		if ctx.Err() != nil {
 			return release()
 		}
 		return p.retry(job, CodeInternal, 0)
 	}
+	// Only waits that obtained a token: cancelled waits would skew it.
+	p.cfg.Metrics.RateLimitWaited(job.Channel, time.Since(waitStart))
 	// Read consent and values after the rate-limit wait, as close to the
 	// send as possible.
 	r, err := p.store.Recipient(ctx, job)

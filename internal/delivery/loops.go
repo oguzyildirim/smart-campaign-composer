@@ -119,6 +119,8 @@ type Maintenance interface {
 	// PurgePublishedOutbox deletes outbox messages published longer ago
 	// than olderThan.
 	PurgePublishedOutbox(ctx context.Context, olderThan time.Duration) (int, error)
+	// PendingOutbox counts unpublished outbox messages.
+	PendingOutbox(ctx context.Context) (int, error)
 }
 
 // MaintenanceConfig paces RunMaintenance.
@@ -128,6 +130,9 @@ type MaintenanceConfig struct {
 	// OutboxRetention keeps published outbox rows this long for
 	// inspection.
 	OutboxRetention time.Duration
+	// Metrics receives recovered leases and the outbox backlog; nil
+	// discards them.
+	Metrics Metrics
 }
 
 // purgeEvery runs the outbox purge on every n-th maintenance tick.
@@ -138,6 +143,9 @@ const purgeEvery = 60
 // net: workers also complete a campaign when they finish its last
 // delivery.
 func RunMaintenance(ctx context.Context, m Maintenance, cfg MaintenanceConfig, logger *slog.Logger) error {
+	if cfg.Metrics == nil {
+		cfg.Metrics = NopMetrics{}
+	}
 	for tick := 0; ; tick++ {
 		maintain(ctx, m, cfg, tick%purgeEvery == 0, logger)
 		if !sleep(ctx, cfg.Interval) {
@@ -150,6 +158,7 @@ func maintain(ctx context.Context, m Maintenance, cfg MaintenanceConfig, purge b
 	if n, err := m.RecoverExpiredLeases(ctx, cfg.BatchSize); err != nil {
 		logMaintenanceError(ctx, logger, "recover expired leases", err)
 	} else if n > 0 {
+		cfg.Metrics.LeasesRecovered(n)
 		logger.InfoContext(ctx, "recovered deliveries with expired leases", "deliveries", n)
 	}
 	for {
@@ -165,6 +174,11 @@ func maintain(ctx context.Context, m Maintenance, cfg MaintenanceConfig, purge b
 		logMaintenanceError(ctx, logger, "complete finished campaigns", err)
 	} else if n > 0 {
 		logger.InfoContext(ctx, "completed campaigns", "campaigns", n)
+	}
+	if n, err := m.PendingOutbox(ctx); err != nil {
+		logMaintenanceError(ctx, logger, "count pending outbox", err)
+	} else {
+		cfg.Metrics.OutboxPending(n)
 	}
 	if purge {
 		if _, err := m.PurgePublishedOutbox(ctx, cfg.OutboxRetention); err != nil {

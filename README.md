@@ -5,7 +5,7 @@ audience segment and SMS/email drafts. A human reviews, edits, and approves,
 and approved messages go only to fake users through a local mock provider.
 **No real SMS or email is ever sent.**
 
-> **Status: Milestone 5 (queue and reliable delivery).** The stack starts
+> **Status: Milestone 6 (live monitoring).** The stack starts
 > with ~5000 seeded fake users. In the browser, a marketer writes a brief
 > (Turkish or English), sees the proposed audience with per-channel counts,
 > watches SMS and email drafts stream in, edits them, previews them
@@ -14,8 +14,10 @@ and approved messages go only to fake users through a local mock provider.
 > delivery per consented recipient and channel. Workers send them through
 > Kafka to the local mock provider, which fails, delays, and rate-limits on
 > purpose, with retries, idempotency keys, and a shared limit of at most 100
-> messages per second per channel. Claude or a deterministic mock does the
-> AI work. The live dashboard and metrics are not implemented yet.
+> messages per second per channel. After approval a live dashboard shows
+> queued, processing, sent, failed and retrying messages per channel as
+> they change. The api and worker expose Prometheus metrics. Claude or a
+> deterministic mock does the AI work.
 
 ## Requirements
 
@@ -343,6 +345,77 @@ a hash of `MOCK_SEED`, the idempotency key, and the attempt number for that
 key, so a fixed seed reproduces them however requests interleave. State is
 in memory: restarting the mock provider forgets delivered keys and stats.
 
+## Live monitoring
+
+Approving a campaign opens its dashboard (`/campaigns/{id}/dashboard`; the
+campaign list and the review page link to it). It shows the campaign status,
+per-channel counts for every delivery status, overall and per-channel
+progress bars, the recent send rate, failures by reason, and a connection
+indicator (live / reconnecting / disconnected / completed).
+
+```
+browser ──GET /progress──► api ──► one aggregate query (snapshot)
+browser ══EventSource /events══► api ◄── shared poller per campaign (1 query/s,
+                                         however many viewers) ──► postgres
+```
+
+- `GET /api/v1/campaigns/{id}/progress` returns the snapshot as JSON:
+
+  ```json
+  {"campaign_id":"…","campaign_status":"sending",
+   "channels":[{"channel":"sms","queued":100,"processing":10,"sent":140,"failed":2,"retrying":10,"total":262,"sent_recently":90,"percent_done":54.2}, …],
+   "totals":{"queued":220,"processing":16,"sent":250,"failed":6,"retrying":16,"total":508},
+   "percent_done":50.39,"failures":[{"code":"provider_rejected","count":5}],
+   "throughput":{"window_seconds":10,"sent":150,"per_second":15},"generated_at":"…"}
+  ```
+
+- `GET /api/v1/campaigns/{id}/events` is a Server-Sent Events stream for
+  `EventSource`: a `snapshot` event on connect, another one only when the
+  state changed, and a final `complete` event (then the stream closes) once
+  the campaign is completed. Every event carries the full snapshot, so a
+  reconnect or a repeated event can never inflate the numbers. Event ids
+  continue from `Last-Event-ID`; a reconnect always starts with a fresh
+  snapshot. Heartbeat comments every 15 s. More than
+  `PROGRESS_MAX_VIEWERS` streams on one campaign get `429 too_many_viewers`.
+
+```bash
+curl -s localhost:8080/api/v1/campaigns/$ID/progress
+curl -sN localhost:8080/api/v1/campaigns/$ID/events     # Ctrl-C to stop
+```
+
+### Metrics
+
+Prometheus text format on `GET /metrics` of the api (`localhost:8080/metrics`)
+and of each worker (port 8081, published on an ephemeral host port per
+replica). nginx does not proxy `/api/metrics`. No Prometheus or Grafana runs
+in the stack; point your own scraper at these endpoints.
+
+```bash
+curl -s localhost:8080/metrics | grep -E '^(http_requests_total|llm_)'
+curl -s localhost:$(docker compose port --index 1 worker 8081 | cut -d: -f2)/metrics \
+  | grep -E '^(deliveries_total|provider_|retries_scheduled_total|rate_limiter_wait|outbox_pending|leases_recovered_total)'
+```
+
+| Metric | Labels | Where |
+| --- | --- | --- |
+| `http_requests_total`, `http_request_duration_seconds` | `route` (chi pattern), `method`, `status_class` (SSE stream durations are not observed) | api, worker |
+| `llm_requests_total`, `llm_request_duration_seconds`, `llm_validation_failures_total` | `operation`, `outcome` | api |
+| `deliveries_total` | `channel`, `outcome` (`sent`, `failed`, `retrying`, `released`) | worker |
+| `provider_request_duration_seconds`, `provider_responses_total` | `channel`, `code_class` (`2xx`, `4xx`, `429`, `5xx`, `error`) | worker |
+| `retries_scheduled_total` | `channel`, `reason` (error code) | worker |
+| `rate_limiter_wait_seconds` | `channel` | worker |
+| `outbox_pending` (gauge), `leases_recovered_total` | none | worker |
+
+Labels never carry campaign, delivery, or user ids, addresses, or raw paths.
+Example PromQL:
+
+```
+sum by (channel) (rate(deliveries_total{outcome="sent"}[1m]))          # sends/s per channel (≤ 100)
+sum by (channel, code_class) (rate(provider_responses_total[5m]))       # provider error mix
+histogram_quantile(0.95, sum by (le, channel) (rate(rate_limiter_wait_seconds_bucket[5m])))
+sum by (operation) (rate(llm_validation_failures_total[1h]))
+```
+
 ## Commands
 
 | Command          | What it does                                                            |
@@ -363,6 +436,8 @@ go test ./internal/segment/... -run TestParse_Rejections
 go test ./internal/campaign/... -run TestGenerator_ProposeSegment_InvalidOutput
 go test ./internal/campaign/... -run TestApprove_Rejections
 go test ./internal/httpapi/... -run TestDraftStream
+go test ./internal/httpapi/... -run 'TestProgress|TestEvents'
+go test ./internal/monitoring/... -run TestHub
 go test ./internal/delivery/... -run TestProcess_ProviderErrors
 go test ./internal/mockprovider/... -run TestFaults_DeterministicWithSeed
 go test -tags=integration ./internal/platform/postgres/...   # Docker required
@@ -371,6 +446,9 @@ cd frontend && npm test
 ```
 
 ## Health endpoints
+
+The api (`:8080`), each worker (`:8081`), and the mock provider (`:9090`)
+serve both probes; Compose healthchecks use `/readyz`.
 
 - `GET /healthz`: liveness. Always `200 {"status":"ok"}` while the process
   serves HTTP.
@@ -381,7 +459,8 @@ cd frontend && npm test
   {"status":"unavailable","checks":{"kafka":"ok","postgres":"unavailable"}}
   ```
 
-  Error details are logged server-side only.
+  Error details are logged server-side only. The mock provider has no
+  dependencies, so its `/readyz` is `200` whenever it serves.
 
 ## Configuration
 
@@ -396,6 +475,9 @@ Compose builds the service configuration from `.env` (see `.env.example`).
 | `LLM_MAX_ATTEMPTS`   | api                | `2`      | Calls per request incl. repair attempts (1–3)     |
 | `LLM_SDK_MAX_RETRIES`| api                | `2`      | SDK retries for 429/5xx/connection errors (0–5)   |
 | `LLM_MOCK_STREAM_DELAY` | api             | `40ms`   | Pause between the mock's streamed chunks (max `1s`) |
+| `PROGRESS_POLL_INTERVAL` | api            | `1s`     | Shared progress poll per campaign (100ms–10s)     |
+| `PROGRESS_MAX_VIEWERS` | api              | `20`     | Open dashboard streams per campaign (1–1000)      |
+| `PROGRESS_THROUGHPUT_WINDOW` | api        | `10s`    | Period of the dashboard's send rate (max `5m`)    |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | compose | — | Required; local-only credentials, URL-safe characters |
 | `LOG_LEVEL`          | all                | `info`   | `debug`, `info`, `warn`, `error`                  |
 | `SHUTDOWN_TIMEOUT`   | all                | `10s`    | Graceful shutdown bound, max `60s`                |
@@ -439,8 +521,8 @@ browser ──► frontend (nginx) ──/api──► api ──► postgres �
 ```
 
 ```
-cmd/api            API entry point (chi router, /healthz, /readyz, /api/v1)
-cmd/worker         worker entry point (outbox relay, consumer, maintenance, probes)
+cmd/api            API entry point (chi router, /healthz, /readyz, /metrics, /api/v1)
+cmd/worker         worker entry point (outbox relay, consumer, maintenance, probes, metrics)
 cmd/seed           one-shot fake-data loader
 mock-provider/     mock SMS/email provider entry point
 internal/
@@ -454,19 +536,23 @@ internal/
                    per-recipient rendering with final validation
   delivery         claim → rate limit → consent/render → send → record (Processor);
                    retry policy, shared-bucket limiter, outbox relay, maintenance loops
+  monitoring       progress read model: snapshot, shared per-campaign poller (Hub)
   mockprovider     the mock provider's API: idempotency, fake-recipient guard, faults
   llm              LLM port (interface, request types, errors)
   llm/mockllm      deterministic keyword mock with scripted test faults
   strictjson       strict JSON decoding (duplicate keys, unknown fields, trailing data)
   seed             deterministic fake-data generator + transactional loader
-  httpapi          /api/v1 handlers (segment preview, campaigns, SSE draft stream)
+  httpapi          /api/v1 handlers (segment preview, campaigns, SSE draft stream,
+                   progress JSON + SSE)
   worker           worker lifecycle: dependency wait, setup, long-running tasks
   platform/
-    httpserver     server timeouts, middleware, graceful shutdown, probe client
+    httpserver     server timeouts, middleware, graceful shutdown, probe router + client
+    metrics        Prometheus registry, HTTP middleware, delivery and LLM adapters
     logging        slog JSON logger
     postgres       pgx pool, health checker, audience repository (consent filter),
                    campaign store (row lock + version check, audit events, delivery
-                   materialization), delivery store (claim/lease, outbox), token bucket
+                   materialization), delivery store (claim/lease, outbox), token bucket,
+                   progress repository (one aggregate query)
     kafka          franz-go client, health checker, topic setup, publisher, consumer group
     provider       HTTP client for the mock provider (error classification, Retry-After)
     claude         Claude API adapter (anthropic-sdk-go, structured outputs, streaming)
@@ -475,14 +561,17 @@ internal/
 migrations/        versioned SQL (golang-migrate)
 frontend/          Vue 3 + TypeScript (strict) + Vite + vue-router, Vitest, ESLint
   src/api          typed client, runtime response guards, fetch-based SSE reader
-  src/views        campaign list, new campaign, review (stream, edit, preview, approve)
+  src/views        campaign list, new campaign, review (stream, edit, preview, approve),
+                   delivery dashboard (EventSource)
 ```
 
 Dependencies flow inward. Entry points wire the platform adapters. The
 `segment`, `content`, `llm`, `campaign`, and `delivery` packages import
 neither HTTP, database, queue, nor LLM SDK code. The Postgres and Kafka
-adapters, the provider and Claude clients, and the HTTP handlers depend on
-them, not the reverse. See [DECISIONS.md](DECISIONS.md) for the reasoning
+adapters, the provider and Claude clients, the metrics adapters, and the
+HTTP handlers depend on them, not the reverse. `delivery` and `campaign`
+report metrics through small observer ports (`delivery.Metrics`,
+`campaign.LLMMetrics`); only `platform/metrics` imports Prometheus. See [DECISIONS.md](DECISIONS.md) for the reasoning
 behind each choice.
 
 ## Troubleshooting
@@ -508,6 +597,10 @@ behind each choice.
 - **`make test` reports a Kafka container that never starts**: the
   integration tests pull `apache/kafka:4.3.2`; the first run can take a
   minute.
+- **The dashboard says "Reconnecting…"**: the API is unreachable; the
+  browser retries every 2 s and shows a fresh snapshot once back.
+  "Disconnected" means the server refused the stream (for example
+  `429 too_many_viewers`); close other tabs and press *Reconnect*.
 - **Changing Postgres credentials after the first start** has no effect on
   the existing volume. Reset it with `docker compose down -v` (deletes local
   data).
@@ -559,11 +652,20 @@ behind each choice.
   Postgres is down) until it succeeds, and holds its consumer-group
   rebalance meanwhile; other workers keep their partitions but cannot take
   over the stuck worker's until it recovers or is stopped.
+- Dashboard numbers are up to `PROGRESS_POLL_INTERVAL` (1 s) old. A
+  stream reconnecting to a different API instance gets a fresh snapshot,
+  but event ids are per connection (continued from `Last-Event-ID`), not
+  global.
+- `outbox_pending` is counted by every worker; with several workers each
+  reports the same global value (take `max`, not `sum`).
+- The worker's metrics port is published on a random host port, so
+  scraping it from the host needs `docker compose port`.
 - An attempt interrupted by shutdown is given back, so repeated restarts
   in the middle of sends can make more than `DELIVERY_MAX_ATTEMPTS`
   provider calls for one delivery (all with the same idempotency key).
 
 ## Not yet implemented
 
-Everything after Milestone 5: Prometheus metrics, the live delivery
-dashboard, and campaign progress in the UI.
+Milestone 7 (failure-scenario test suite, smoke script, final docs). No
+Prometheus/Grafana containers, alerting, or tracing; no per-recipient
+delivery log in the UI.
