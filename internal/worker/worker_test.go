@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync/atomic"
 	"testing"
@@ -25,7 +26,11 @@ func (f *fakeDeps) Check(context.Context) (map[string]string, bool) {
 }
 
 func newTestWorker(deps Dependencies) *Worker {
-	w := New(deps, discardLogger)
+	return newTestWorkerWith(deps, Config{})
+}
+
+func newTestWorkerWith(deps Dependencies, cfg Config) *Worker {
+	w := New(deps, discardLogger, cfg)
 	w.initialBackoff = time.Millisecond
 	w.maxBackoff = 4 * time.Millisecond
 	return w
@@ -97,5 +102,66 @@ func TestRun_BackoffIsCapped(t *testing.T) {
 	// from 1ms would manage only about seven.
 	if got := deps.calls.Load(); got < 10 {
 		t.Errorf("dependency checks = %d in 100ms, want >= 10 with capped backoff", got)
+	}
+}
+
+func TestRun_SetupThenTasksUntilShutdown(t *testing.T) {
+	var setupDone, started atomic.Int64
+	block := func(ctx context.Context) error {
+		if setupDone.Load() != 1 {
+			return errors.New("task started before setup")
+		}
+		started.Add(1)
+		<-ctx.Done()
+		return nil
+	}
+	w := newTestWorkerWith(&fakeDeps{}, Config{
+		Setup: func(context.Context) error { setupDone.Add(1); return nil },
+		Tasks: []Task{{Name: "a", Run: block}, {Name: "b", Run: block}},
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := runAsync(ctx, w)
+	deadline := time.Now().Add(2 * time.Second)
+	for started.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if started.Load() != 2 {
+		t.Fatalf("tasks started = %d, want 2", started.Load())
+	}
+	cancel()
+	waitDone(t, done)
+}
+
+func TestRun_FailingTaskStopsTheWorker(t *testing.T) {
+	stopped := make(chan struct{})
+	w := newTestWorkerWith(&fakeDeps{}, Config{Tasks: []Task{
+		{Name: "healthy", Run: func(ctx context.Context) error { <-ctx.Done(); close(stopped); return nil }},
+		{Name: "broken", Run: func(context.Context) error { return errors.New("boom") }},
+	}})
+	err := w.Run(t.Context())
+	if err == nil || err.Error() != "broken: boom" {
+		t.Fatalf("Run() = %v, want the broken task's error", err)
+	}
+	<-stopped // the healthy task was cancelled
+}
+
+func TestRun_TaskExitingEarlyIsAnError(t *testing.T) {
+	w := newTestWorkerWith(&fakeDeps{}, Config{Tasks: []Task{{Name: "quitter", Run: func(context.Context) error { return nil }}}})
+	if err := w.Run(t.Context()); !errors.Is(err, errExitedEarly) {
+		t.Fatalf("Run() = %v, want errExitedEarly", err)
+	}
+}
+
+func TestRun_SetupFailureStopsTheWorker(t *testing.T) {
+	ran := false
+	w := newTestWorkerWith(&fakeDeps{}, Config{
+		Setup: func(context.Context) error { return errors.New("no topics") },
+		Tasks: []Task{{Name: "t", Run: func(context.Context) error { ran = true; return nil }}},
+	})
+	if err := w.Run(t.Context()); err == nil {
+		t.Fatal("Run() = nil, want the setup error")
+	}
+	if ran {
+		t.Error("tasks ran after a failed setup")
 	}
 }

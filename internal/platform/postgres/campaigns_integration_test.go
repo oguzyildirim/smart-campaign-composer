@@ -52,7 +52,7 @@ func newCampaignEnv(t *testing.T) campaignEnv {
 	}, logger)
 	store := postgres.NewCampaignStore(pool)
 	svc := campaign.NewService(gen, store, audience,
-		campaign.ServiceConfig{GenerationTimeout: 10 * time.Second, PreviewSamples: 3}, now, logger)
+		campaign.ServiceConfig{GenerationTimeout: 10 * time.Second, PreviewSamples: 3, DeliveryMaxAttempts: 5}, now, logger)
 	return campaignEnv{pool: pool, store: store, svc: svc}
 }
 

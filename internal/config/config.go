@@ -36,6 +36,36 @@ const (
 	// shows drafts arriving; about one second for the example drafts.
 	DefaultLLMMockStreamDelay = 40 * time.Millisecond
 
+	DefaultDeliveryMaxAttempts  = 5
+	DefaultProviderURL          = "http://mock-provider:9090"
+	DefaultProviderTimeout      = 5 * time.Second
+	DefaultRetryBaseDelay       = time.Second
+	DefaultRetryMaxDelay        = 60 * time.Second
+	DefaultRetryBackoffFactor   = 2
+	DefaultDeliveryLease        = 60 * time.Second
+	DefaultWorkerConcurrency    = 16
+	DefaultRateLimitPerSecond   = 90
+	DefaultRateLimitBurst       = 5
+	DefaultKafkaTopicPartitions = 6
+	DefaultOutboxPollInterval   = 200 * time.Millisecond
+	DefaultOutboxBatchSize      = 500
+	DefaultDeliveryScanInterval = time.Second
+	// MaxSendsPerSecond is the product limit per channel. Rate plus burst
+	// may not exceed it: a token bucket admits at most rate + burst sends
+	// in any one-second window.
+	MaxSendsPerSecond = 100
+
+	// Mock provider fault defaults: about 20% of first attempts fail
+	// transiently, 1% of recipients are rejected permanently.
+	DefaultMockLatencyMin        = 10 * time.Millisecond
+	DefaultMockLatencyMax        = 80 * time.Millisecond
+	DefaultMockRateLimitRate     = 0.06
+	DefaultMockRetryAfter        = time.Second
+	DefaultMockServerErrorRate   = 0.08
+	DefaultMockPermanentRate     = 0.01
+	DefaultMockLostResponseRate  = 0.03
+	DefaultMockLostResponseDelay = 8 * time.Second
+
 	maxShutdownTimeout = 60 * time.Second
 	maxCheckTimeout    = 30 * time.Second
 	maxRequestTimeout  = 5 * time.Minute
@@ -75,9 +105,34 @@ type Config struct {
 	// deterministic mock LLM.
 	AnthropicAPIKey Secret
 
-	API    APIConfig
-	Worker WorkerConfig
-	LLM    LLMConfig
+	API      APIConfig
+	Worker   WorkerConfig
+	LLM      LLMConfig
+	Delivery DeliveryConfig
+}
+
+// DeliveryConfig configures message delivery. MaxAttempts is used by the
+// API (stored on each delivery at approval); the rest by the worker.
+type DeliveryConfig struct {
+	MaxAttempts     int
+	ProviderURL     string
+	ProviderTimeout time.Duration
+	// Retry backoff: RetryBaseDelay·RetryBackoffFactor^(attempt-1), capped
+	// at RetryMaxDelay, with full jitter.
+	RetryBaseDelay     time.Duration
+	RetryMaxDelay      time.Duration
+	RetryBackoffFactor int
+	// Lease is how long a claimed delivery stays exclusive to one worker.
+	Lease       time.Duration
+	Concurrency int
+	// RateLimitPerSecond and RateLimitBurst configure each channel's
+	// shared token bucket; their sum is at most MaxSendsPerSecond.
+	RateLimitPerSecond  int
+	RateLimitBurst      int
+	TopicPartitions     int
+	OutboxPollInterval  time.Duration
+	OutboxBatchSize     int
+	MaintenanceInterval time.Duration
 }
 
 // LLMConfig configures AI generation.
@@ -123,6 +178,19 @@ type MockProviderConfig struct {
 	LogLevel        slog.Level
 	Addr            string
 	ShutdownTimeout time.Duration
+	// Seed drives the simulated faults; 0 picks a random seed at start.
+	Seed uint64
+	// Faults; rates are probabilities in [0, 1].
+	LatencyMin           time.Duration
+	LatencyMax           time.Duration
+	RateLimitRate        float64
+	RetryAfter           time.Duration
+	ServerErrorRate      float64
+	PermanentFailureRate float64
+	LostResponseRate     float64
+	LostResponseDelay    time.Duration
+	// MaxPerSecond is the provider's own per-channel limit; 0 disables it.
+	MaxPerSecond int
 }
 
 // SeedConfig is the configuration of cmd/seed.
@@ -153,6 +221,32 @@ func Load(getenv Getenv) (Config, error) {
 			HealthAddr: p.addr("WORKER_HEALTH_ADDR", DefaultWorkerHealthAddr),
 		},
 	}
+	cfg.Delivery = DeliveryConfig{
+		MaxAttempts:         p.intRange("DELIVERY_MAX_ATTEMPTS", DefaultDeliveryMaxAttempts, 1, 20),
+		ProviderURL:         p.httpURL("PROVIDER_URL", DefaultProviderURL),
+		ProviderTimeout:     p.duration("PROVIDER_TIMEOUT", DefaultProviderTimeout, time.Minute),
+		RetryBaseDelay:      p.duration("RETRY_BASE_DELAY", DefaultRetryBaseDelay, time.Minute),
+		RetryMaxDelay:       p.duration("RETRY_MAX_DELAY", DefaultRetryMaxDelay, time.Hour),
+		RetryBackoffFactor:  p.intRange("RETRY_BACKOFF_FACTOR", DefaultRetryBackoffFactor, 1, 10),
+		Lease:               p.duration("DELIVERY_LEASE", DefaultDeliveryLease, 10*time.Minute),
+		Concurrency:         p.intRange("WORKER_CONCURRENCY", DefaultWorkerConcurrency, 1, 256),
+		RateLimitPerSecond:  p.intRange("RATE_LIMIT_PER_SECOND", DefaultRateLimitPerSecond, 1, MaxSendsPerSecond),
+		RateLimitBurst:      p.intRange("RATE_LIMIT_BURST", DefaultRateLimitBurst, 1, MaxSendsPerSecond),
+		TopicPartitions:     p.intRange("KAFKA_TOPIC_PARTITIONS", DefaultKafkaTopicPartitions, 1, 64),
+		OutboxPollInterval:  p.duration("OUTBOX_POLL_INTERVAL", DefaultOutboxPollInterval, 10*time.Second),
+		OutboxBatchSize:     p.intRange("OUTBOX_BATCH_SIZE", DefaultOutboxBatchSize, 1, 5000),
+		MaintenanceInterval: p.duration("DELIVERY_SCAN_INTERVAL", DefaultDeliveryScanInterval, time.Minute),
+	}
+	d := cfg.Delivery
+	if d.RateLimitPerSecond+d.RateLimitBurst > MaxSendsPerSecond {
+		p.fail("RATE_LIMIT_PER_SECOND", "plus RATE_LIMIT_BURST must be at most %d, got %d", MaxSendsPerSecond, d.RateLimitPerSecond+d.RateLimitBurst)
+	}
+	if d.RetryMaxDelay < d.RetryBaseDelay {
+		p.fail("RETRY_MAX_DELAY", "must be at least RETRY_BASE_DELAY (%s)", d.RetryBaseDelay)
+	}
+	if d.Lease < 2*d.ProviderTimeout {
+		p.fail("DELIVERY_LEASE", "must be at least twice PROVIDER_TIMEOUT (%s)", d.ProviderTimeout)
+	}
 	cfg.LLM = LLMConfig{
 		Provider:        p.llmProvider("LLM_PROVIDER", cfg.AnthropicAPIKey.IsSet()),
 		Model:           p.model("ANTHROPIC_MODEL", DefaultAnthropicModel),
@@ -177,6 +271,20 @@ func LoadMockProvider(getenv Getenv) (MockProviderConfig, error) {
 		LogLevel:        p.logLevel("LOG_LEVEL"),
 		Addr:            p.addr("MOCK_PROVIDER_ADDR", DefaultMockProviderAddr),
 		ShutdownTimeout: p.duration("SHUTDOWN_TIMEOUT", DefaultShutdownTimeout, maxShutdownTimeout),
+		Seed:            p.uint64("MOCK_SEED", 0),
+
+		LatencyMin:           p.durationOrZero("MOCK_LATENCY_MIN", DefaultMockLatencyMin, 10*time.Second),
+		LatencyMax:           p.durationOrZero("MOCK_LATENCY_MAX", DefaultMockLatencyMax, 10*time.Second),
+		RateLimitRate:        p.probability("MOCK_RATE_LIMIT_RATE", DefaultMockRateLimitRate),
+		RetryAfter:           p.duration("MOCK_RETRY_AFTER", DefaultMockRetryAfter, 5*time.Minute),
+		ServerErrorRate:      p.probability("MOCK_SERVER_ERROR_RATE", DefaultMockServerErrorRate),
+		PermanentFailureRate: p.probability("MOCK_PERMANENT_FAILURE_RATE", DefaultMockPermanentRate),
+		LostResponseRate:     p.probability("MOCK_LOST_RESPONSE_RATE", DefaultMockLostResponseRate),
+		LostResponseDelay:    p.duration("MOCK_LOST_RESPONSE_DELAY", DefaultMockLostResponseDelay, 5*time.Minute),
+		MaxPerSecond:         p.intRange("MOCK_MAX_PER_SECOND", MaxSendsPerSecond, 0, 100000),
+	}
+	if cfg.LatencyMax < cfg.LatencyMin {
+		p.fail("MOCK_LATENCY_MAX", "must be at least MOCK_LATENCY_MIN (%s)", cfg.LatencyMin)
 	}
 
 	if err := p.err(); err != nil {
@@ -304,6 +412,41 @@ func (p *parser) duration(key string, def, upper time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+// durationOrZero is duration that also accepts 0.
+func (p *parser) durationOrZero(key string, def, upper time.Duration) time.Duration {
+	if raw := p.get(key); raw == "0" || raw == "0s" {
+		return 0
+	}
+	return p.duration(key, def, upper)
+}
+
+func (p *parser) probability(key string, def float64) float64 {
+	raw := p.get(key)
+	if raw == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(raw, 64)
+	if err != nil || f < 0 || f > 1 {
+		p.fail(key, "must be a number between 0 and 1, got %q", raw)
+		return def
+	}
+	return f
+}
+
+// httpURL accepts an http(s) URL with a host and no credentials.
+func (p *parser) httpURL(key, def string) string {
+	raw := p.get(key)
+	if raw == "" {
+		return def
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+		p.fail(key, "must be an http(s)://host[:port] URL without credentials")
+		return def
+	}
+	return raw
 }
 
 func (p *parser) intRange(key string, def, lower, upper int) int {

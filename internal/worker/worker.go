@@ -1,12 +1,16 @@
-// Package worker contains the background worker's lifecycle. In this
-// milestone the worker only waits for its dependencies and idles until
-// shutdown; queue consumption arrives with the delivery milestone.
+// Package worker contains the background worker's lifecycle: wait for
+// dependencies, run a setup step, then run the long-running tasks (outbox
+// relay, queue consumer, maintenance) until shutdown.
 package worker
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // Dependencies reports whether every dependency is reachable.
@@ -21,38 +25,83 @@ const (
 	DefaultMaxBackoff     = 5 * time.Second
 )
 
+// Task is a long-running part of the worker. Run blocks until ctx ends and
+// then returns nil; returning earlier is a failure.
+type Task struct {
+	Name string
+	Run  func(ctx context.Context) error
+}
+
+// Config lists what the worker runs once its dependencies are ready.
+type Config struct {
+	// Setup runs once before the tasks start, for example to create queue
+	// topics. Its failure stops the worker.
+	Setup func(ctx context.Context) error
+	Tasks []Task
+}
+
 // Worker is the background processing loop.
 type Worker struct {
 	deps           Dependencies
 	logger         *slog.Logger
+	cfg            Config
 	initialBackoff time.Duration
 	maxBackoff     time.Duration
 }
 
 // New returns a Worker with the default startup backoff.
-func New(deps Dependencies, logger *slog.Logger) *Worker {
+func New(deps Dependencies, logger *slog.Logger, cfg Config) *Worker {
 	return &Worker{
 		deps:           deps,
 		logger:         logger,
+		cfg:            cfg,
 		initialBackoff: DefaultInitialBackoff,
 		maxBackoff:     DefaultMaxBackoff,
 	}
 }
 
 // Run blocks until ctx is cancelled. It first waits for dependencies,
-// retrying with capped exponential backoff, and logs once they are ready.
-// It returns nil on cancellation; there is no in-flight work to drain yet.
+// retrying with capped exponential backoff, then runs Setup and every
+// task. If a task fails or exits early, the others are cancelled and Run
+// returns the error, so the process restarts instead of running half
+// alive. It returns nil after a clean shutdown.
 func (w *Worker) Run(ctx context.Context) error {
 	if !w.waitForDependencies(ctx) {
 		w.logger.Info("worker stopped before dependencies became ready")
 		return nil
 	}
-	w.logger.InfoContext(ctx, "worker ready")
+	if w.cfg.Setup != nil {
+		if err := w.cfg.Setup(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("worker setup: %w", err)
+		}
+	}
+	w.logger.InfoContext(ctx, "worker ready", "tasks", len(w.cfg.Tasks))
 
-	<-ctx.Done()
+	g, gctx := errgroup.WithContext(ctx)
+	for _, t := range w.cfg.Tasks {
+		g.Go(func() error {
+			err := t.Run(gctx)
+			switch {
+			case err != nil:
+				return fmt.Errorf("%s: %w", t.Name, err)
+			case gctx.Err() == nil:
+				return fmt.Errorf("%s: %w", t.Name, errExitedEarly)
+			}
+			return nil
+		})
+	}
+	err := g.Wait()
+	if err == nil {
+		<-ctx.Done() // no tasks: idle until shutdown
+	}
 	w.logger.Info("worker stopped")
-	return nil
+	return err
 }
+
+var errExitedEarly = errors.New("task exited before shutdown")
 
 // waitForDependencies returns true once all checks pass, or false if ctx is
 // cancelled first.

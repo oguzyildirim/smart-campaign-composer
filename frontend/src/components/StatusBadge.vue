@@ -8,6 +8,8 @@ const labels: Record<CampaignStatus, string> = {
   audience_ready: 'Audience ready',
   drafts_ready: 'Drafts ready',
   approved: 'Approved',
+  sending: 'Sending',
+  completed: 'Completed',
 }
 </script>
 
@@ -30,8 +32,13 @@ const labels: Record<CampaignStatus, string> = {
 .status--drafts_ready {
   background: #dbeafe;
 }
-.status--approved {
+.status--approved,
+.status--completed {
   background: #dcfce7;
   color: #14532d;
+}
+.status--sending {
+  background: #fef9c3;
+  color: #713f12;
 }
 </style>

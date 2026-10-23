@@ -18,6 +18,8 @@ x-app-env: &app-env
   DATABASE_URL: postgres://${POSTGRES_USER:?copy .env.example to .env}:${POSTGRES_PASSWORD:?copy .env.example to .env}@postgres:5432/${POSTGRES_DB:?copy .env.example to .env}?sslmode=disable
   KAFKA_BROKERS: kafka:9092
   SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-10s}
+  # Stored on each delivery at approval (api) and enforced by workers.
+  DELIVERY_MAX_ATTEMPTS: ${DELIVERY_MAX_ATTEMPTS:-5}
 
 services:
   postgres:
@@ -54,7 +56,7 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_LOG_DIRS: /var/lib/kafka/data
-      # Topics are created explicitly by the application in later milestones.
+      # The worker creates deliveries.sms and deliveries.email at startup.
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
     volumes:
       - kafka-data:/var/lib/kafka/data
@@ -136,6 +138,9 @@ services:
       retries: 5
       start_period: 5s
 
+  # Safe to scale: docker compose up -d --scale worker=3. Workers share
+  # one consumer group, claim deliveries exclusively in Postgres, and share
+  # each channel's rate limit through Postgres.
   worker:
     <<: *go-service
     build:
@@ -145,6 +150,16 @@ services:
     environment:
       <<: *app-env
       WORKER_HEALTH_ADDR: :8081
+      PROVIDER_URL: http://mock-provider:9090
+      PROVIDER_TIMEOUT: ${PROVIDER_TIMEOUT:-5s}
+      RETRY_BASE_DELAY: ${RETRY_BASE_DELAY:-1s}
+      RETRY_MAX_DELAY: ${RETRY_MAX_DELAY:-60s}
+      RETRY_BACKOFF_FACTOR: ${RETRY_BACKOFF_FACTOR:-2}
+      DELIVERY_LEASE: ${DELIVERY_LEASE:-60s}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-16}
+      RATE_LIMIT_PER_SECOND: ${RATE_LIMIT_PER_SECOND:-90}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-5}
+      KAFKA_TOPIC_PARTITIONS: ${KAFKA_TOPIC_PARTITIONS:-6}
     depends_on:
       postgres:
         condition: service_healthy
@@ -170,6 +185,17 @@ services:
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       MOCK_PROVIDER_ADDR: :9090
+      SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-10s}
+      MOCK_SEED: ${MOCK_SEED:-0}
+      MOCK_LATENCY_MIN: ${MOCK_LATENCY_MIN:-10ms}
+      MOCK_LATENCY_MAX: ${MOCK_LATENCY_MAX:-80ms}
+      MOCK_RATE_LIMIT_RATE: ${MOCK_RATE_LIMIT_RATE:-0.06}
+      MOCK_RETRY_AFTER: ${MOCK_RETRY_AFTER:-1s}
+      MOCK_SERVER_ERROR_RATE: ${MOCK_SERVER_ERROR_RATE:-0.08}
+      MOCK_PERMANENT_FAILURE_RATE: ${MOCK_PERMANENT_FAILURE_RATE:-0.01}
+      MOCK_LOST_RESPONSE_RATE: ${MOCK_LOST_RESPONSE_RATE:-0.03}
+      MOCK_LOST_RESPONSE_DELAY: ${MOCK_LOST_RESPONSE_DELAY:-8s}
+      MOCK_MAX_PER_SECOND: ${MOCK_MAX_PER_SECOND:-100}
     ports:
       - "127.0.0.1:${MOCK_PROVIDER_PORT:-9090}:9090"
     healthcheck:

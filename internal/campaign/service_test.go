@@ -84,7 +84,7 @@ func newEnvWithAudience(t *testing.T, aud map[content.Channel]campaign.ChannelAu
 		SegmentTimeout: 5 * time.Second, DraftsTimeout: 5 * time.Second, MaxAttempts: 2,
 	}, logger)
 	e.svc = campaign.NewService(gen, e.store, e.audience,
-		campaign.ServiceConfig{GenerationTimeout: 10 * time.Second, PreviewSamples: 3}, e.clock.Now, logger)
+		campaign.ServiceConfig{GenerationTimeout: 10 * time.Second, PreviewSamples: 3, DeliveryMaxAttempts: 4}, e.clock.Now, logger)
 	return e
 }
 

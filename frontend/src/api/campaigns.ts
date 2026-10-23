@@ -17,8 +17,16 @@ import {
 } from './guards'
 import { readSSE } from './sse'
 
-export const STATUSES = ['draft', 'audience_ready', 'drafts_ready', 'approved'] as const
+export const STATUSES = ['draft', 'audience_ready', 'drafts_ready', 'approved', 'sending', 'completed'] as const
 export type CampaignStatus = (typeof STATUSES)[number]
+
+// Statuses after human approval, as reported by the backend. Their content
+// can no longer change.
+const APPROVED_STATUSES: readonly CampaignStatus[] = ['approved', 'sending', 'completed']
+
+export function isApproved(status: CampaignStatus): boolean {
+  return APPROVED_STATUSES.includes(status)
+}
 
 export const CHANNELS = ['sms', 'email'] as const
 export type Channel = (typeof CHANNELS)[number]

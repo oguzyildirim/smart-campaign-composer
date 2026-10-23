@@ -98,8 +98,9 @@ func run(ctx context.Context) error {
 		MaxAttempts:    cfg.LLM.MaxAttempts,
 	}, logger)
 	campaigns := campaign.NewService(generator, postgres.NewCampaignStore(pool), audience, campaign.ServiceConfig{
-		GenerationTimeout: cfg.LLM.RouteTimeout(),
-		PreviewSamples:    previewSamples,
+		GenerationTimeout:   cfg.LLM.RouteTimeout(),
+		PreviewSamples:      previewSamples,
+		DeliveryMaxAttempts: cfg.Delivery.MaxAttempts,
 	}, time.Now, logger)
 
 	// Timeouts are per route: LLM routes need room for every attempt, and

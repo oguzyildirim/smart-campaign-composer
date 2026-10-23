@@ -113,7 +113,13 @@ func (s *CampaignStore) Update(ctx context.Context, id campaign.ID, fn campaign.
 		if result, err = writeCampaign(ctx, tx, cur.Version, w.Campaign); err != nil {
 			return err
 		}
-		return insertEvents(ctx, tx, id, w.Events)
+		if err := insertEvents(ctx, tx, id, w.Events); err != nil {
+			return err
+		}
+		if w.Deliveries != nil {
+			return materializeDeliveries(ctx, tx, id, *w.Deliveries)
+		}
+		return nil
 	})
 	if err != nil {
 		return campaign.Campaign{}, err

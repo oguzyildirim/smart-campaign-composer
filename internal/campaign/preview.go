@@ -54,7 +54,11 @@ func (s *Service) Preview(ctx context.Context, id ID) (Preview, error) {
 	if !c.HasDrafts() {
 		return Preview{}, fail(CodeInvalidState, "the campaign has no drafts yet")
 	}
-	channels, audienceErrs, err := s.inspect(ctx, s.audience, c, max(s.cfg.PreviewSamples, 1))
+	pred, err := segment.Compile(c.Rule, s.now().UTC())
+	if err != nil {
+		return Preview{}, fmt.Errorf("compile campaign segment: %w", err)
+	}
+	channels, audienceErrs, err := s.inspect(ctx, s.audience, c, pred, max(s.cfg.PreviewSamples, 1))
 	if err != nil {
 		return Preview{}, err
 	}
@@ -67,13 +71,9 @@ func (s *Service) Preview(ctx context.Context, id ID) (Preview, error) {
 	return Preview{Campaign: c, Validation: v, Channels: channels}, nil
 }
 
-// inspect reads each selected channel's audience and checks the content
-// against its longest real values.
-func (s *Service) inspect(ctx context.Context, audience AudienceInspector, c Campaign, samples int) ([]ChannelPreview, []content.FieldError, error) {
-	pred, err := segment.Compile(c.Rule, s.now().UTC())
-	if err != nil {
-		return nil, nil, fmt.Errorf("compile campaign segment: %w", err)
-	}
+// inspect reads each selected channel's audience (users matching pred)
+// and checks the content against its longest real values.
+func (s *Service) inspect(ctx context.Context, audience AudienceInspector, c Campaign, pred segment.Predicate, samples int) ([]ChannelPreview, []content.FieldError, error) {
 	var (
 		out  []ChannelPreview
 		errs []content.FieldError

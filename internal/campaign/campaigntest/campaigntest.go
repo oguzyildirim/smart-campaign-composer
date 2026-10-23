@@ -25,6 +25,7 @@ type Store struct {
 	campaigns map[campaign.ID]campaign.Campaign
 	order     []campaign.ID
 	events    map[campaign.ID][]campaign.Event
+	plans     map[campaign.ID][]campaign.DeliveryPlan
 	next      int
 }
 
@@ -36,6 +37,7 @@ func NewStore(audience campaign.AudienceInspector) *Store {
 		Audience:  audience,
 		campaigns: map[campaign.ID]campaign.Campaign{},
 		events:    map[campaign.ID][]campaign.Event{},
+		plans:     map[campaign.ID][]campaign.DeliveryPlan{},
 	}
 }
 
@@ -98,7 +100,17 @@ func (s *Store) Update(ctx context.Context, id campaign.ID, fn campaign.UpdateFu
 	next.UpdatedAt = c.UpdatedAt.Add(time.Second)
 	s.campaigns[id] = next
 	s.events[id] = append(s.events[id], w.Events...)
+	if w.Deliveries != nil {
+		s.plans[id] = append(s.plans[id], *w.Deliveries)
+	}
 	return clone(next), nil
+}
+
+// Plans returns the delivery plans written for id, in order.
+func (s *Store) Plans(id campaign.ID) []campaign.DeliveryPlan {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.plans[id])
 }
 
 // Events returns the audit events recorded for id.

@@ -4,6 +4,7 @@ import {
   approveCampaign,
   editCampaign,
   getCampaign,
+  isApproved,
   previewCampaign,
   type Campaign,
   type Channel,
@@ -52,7 +53,7 @@ let saveTimer: ReturnType<typeof setTimeout> | undefined
 let saveQueued = false
 let previewSeq = 0
 
-const readonly = computed(() => campaign.value?.status === 'approved')
+const readonly = computed(() => campaign.value !== null && isApproved(campaign.value.status))
 const editable = computed(() => campaign.value?.status === 'drafts_ready' && !stream.streaming.value)
 const previewCurrent = computed(
   () => preview.value !== null && campaign.value !== null && preview.value.version === campaign.value.version,

@@ -32,8 +32,7 @@ func ParseID(s string) (ID, error) {
 // of truth; clients display it.
 type Status string
 
-// Statuses, in lifecycle order. Milestone 5 adds sending states after
-// approved.
+// Statuses, in lifecycle order.
 const (
 	// StatusDraft: created, no audience yet.
 	StatusDraft Status = "draft"
@@ -41,16 +40,25 @@ const (
 	StatusAudienceReady Status = "audience_ready"
 	// StatusDraftsReady: validated drafts are stored and can be edited.
 	StatusDraftsReady Status = "drafts_ready"
-	// StatusApproved: a human approved the exact content; immutable.
+	// StatusApproved: a human approved the exact content; immutable. Its
+	// deliveries were created with the approval.
 	StatusApproved Status = "approved"
+	// StatusSending: a worker claimed the first delivery.
+	StatusSending Status = "sending"
+	// StatusCompleted: every delivery is sent or failed.
+	StatusCompleted Status = "completed"
 )
 
 // transitions lists the legal status changes. drafts_ready → drafts_ready
-// is a regeneration, which replaces the drafts.
+// is a regeneration, which replaces the drafts. The delivery workers make
+// the transitions after approved; approved → completed covers a campaign
+// with nothing left to send.
 var transitions = map[Status][]Status{
 	StatusDraft:         {StatusAudienceReady},
 	StatusAudienceReady: {StatusDraftsReady},
 	StatusDraftsReady:   {StatusDraftsReady, StatusApproved},
+	StatusApproved:      {StatusSending, StatusCompleted},
+	StatusSending:       {StatusCompleted},
 }
 
 // CanTransition reports whether a campaign may move from one status to
@@ -96,7 +104,13 @@ type Campaign struct {
 
 // HasDrafts reports whether the campaign has reviewable content.
 func (c Campaign) HasDrafts() bool {
-	return c.Status == StatusDraftsReady || c.Status == StatusApproved
+	return c.Status == StatusDraftsReady || c.Approved()
+}
+
+// Approved reports whether a human approved the campaign: it is approved,
+// sending, or completed, and its content can no longer change.
+func (c Campaign) Approved() bool {
+	return c.Status == StatusApproved || c.Status == StatusSending || c.Status == StatusCompleted
 }
 
 // Generating reports whether a draft generation holds the campaign at now.
@@ -127,6 +141,8 @@ const (
 	ActionDraftsGenerated  = "drafts_generated"
 	ActionEdited           = "edited"
 	ActionApproved         = "approved"
+	ActionSendingStarted   = "sending_started"
+	ActionCompleted        = "completed"
 )
 
 // Actors for events not attributed to a named operator. There is no

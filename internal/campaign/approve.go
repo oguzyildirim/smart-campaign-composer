@@ -26,8 +26,11 @@ type Approval struct {
 // Inside one transaction it re-checks the version and content hash,
 // re-validates the segment rule and content, checks lengths against the
 // longest real values of each selected channel's consented recipients,
-// and requires at least one recipient. Approving an approved campaign with
-// the same content hash returns it unchanged.
+// and requires at least one recipient. The same transaction creates one
+// delivery per consented recipient and channel, compiled from the same
+// predicate the checks used. Approving an approved (or sending, or
+// completed) campaign with the same content hash returns it unchanged and
+// creates nothing.
 func (s *Service) Approve(ctx context.Context, id ID, a Approval) (Campaign, error) {
 	approver, err := checkApprover(a.ApprovedBy)
 	if err != nil {
@@ -35,7 +38,7 @@ func (s *Service) Approve(ctx context.Context, id ID, a Approval) (Campaign, err
 	}
 	return s.update(ctx, id, func(ctx context.Context, audience AudienceInspector, c Campaign) (*Write, error) {
 		now := s.now()
-		if c.Status == StatusApproved {
+		if c.Approved() {
 			if a.ContentHash == c.ContentHash {
 				return nil, nil
 			}
@@ -57,7 +60,11 @@ func (s *Service) Approve(ctx context.Context, id ID, a Approval) (Campaign, err
 		if v := c.Validate(); !v.Valid {
 			return nil, fail(CodeInvalidContent, "", v.Errors...)
 		}
-		channels, audienceErrs, err := s.inspect(ctx, audience, c, 0)
+		pred, err := segment.Compile(c.Rule, now.UTC())
+		if err != nil {
+			return nil, fmt.Errorf("compile campaign segment: %w", err)
+		}
+		channels, audienceErrs, err := s.inspect(ctx, audience, c, pred, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -70,9 +77,13 @@ func (s *Service) Approve(ctx context.Context, id ID, a Approval) (Campaign, err
 		from := c.Status
 		c.Status, c.ApprovedBy, c.ApprovedAt = StatusApproved, approver, now
 		c.Version++
-		return &Write{Campaign: c, Events: []Event{{
-			Action: ActionApproved, Actor: approver, From: from, To: c.Status, Version: c.Version,
-		}}}, nil
+		return &Write{
+			Campaign: c,
+			Events: []Event{{
+				Action: ActionApproved, Actor: approver, From: from, To: c.Status, Version: c.Version,
+			}},
+			Deliveries: &DeliveryPlan{Predicate: pred, Channels: c.Channels, MaxAttempts: s.cfg.DeliveryMaxAttempts},
+		}, nil
 	})
 }
 

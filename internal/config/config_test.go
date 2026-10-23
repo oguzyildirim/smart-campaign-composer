@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strings"
 	"testing"
 	"time"
@@ -256,6 +257,81 @@ func TestLoadMockProvider(t *testing.T) {
 	_, err = LoadMockProvider(envFrom(map[string]string{"MOCK_PROVIDER_ADDR": "nope"}))
 	if err == nil || !strings.Contains(err.Error(), "MOCK_PROVIDER_ADDR") {
 		t.Errorf("LoadMockProvider() error = %v, want MOCK_PROVIDER_ADDR error", err)
+	}
+}
+
+func TestLoad_Delivery(t *testing.T) {
+	cfg, err := Load(envFrom(validEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := cfg.Delivery
+	if d.MaxAttempts != 5 || d.ProviderURL != DefaultProviderURL || d.RateLimitPerSecond != 90 || d.RateLimitBurst != 5 ||
+		d.RetryBaseDelay != time.Second || d.RetryMaxDelay != time.Minute || d.RetryBackoffFactor != 2 ||
+		d.Lease != time.Minute || d.TopicPartitions != 6 {
+		t.Errorf("delivery defaults = %+v", d)
+	}
+	if d.RateLimitPerSecond+d.RateLimitBurst > MaxSendsPerSecond {
+		t.Errorf("default rate + burst exceeds %d/s", MaxSendsPerSecond)
+	}
+
+	tests := []struct {
+		name    string
+		vars    map[string]string
+		wantErr string
+	}{
+		{"rate plus burst over 100", map[string]string{"RATE_LIMIT_PER_SECOND": "96", "RATE_LIMIT_BURST": "5"}, "RATE_LIMIT_PER_SECOND"},
+		{"rate over 100", map[string]string{"RATE_LIMIT_PER_SECOND": "101"}, "RATE_LIMIT_PER_SECOND"},
+		{"zero burst", map[string]string{"RATE_LIMIT_BURST": "0"}, "RATE_LIMIT_BURST"},
+		{"lease shorter than two provider timeouts", map[string]string{"DELIVERY_LEASE": "15s", "PROVIDER_TIMEOUT": "10s"}, "DELIVERY_LEASE"},
+		{"max delay below base", map[string]string{"RETRY_BASE_DELAY": "10s", "RETRY_MAX_DELAY": "5s"}, "RETRY_MAX_DELAY"},
+		{"too many attempts", map[string]string{"DELIVERY_MAX_ATTEMPTS": "21"}, "DELIVERY_MAX_ATTEMPTS"},
+		{"provider URL without scheme", map[string]string{"PROVIDER_URL": "mock-provider:9090"}, "PROVIDER_URL"},
+		{"provider URL with credentials", map[string]string{"PROVIDER_URL": "http://u:p@mock-provider:9090"}, "PROVIDER_URL"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vars := validEnv()
+			maps.Copy(vars, tt.vars)
+			_, err := Load(envFrom(vars))
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Load() error = %v, want one mentioning %s", err, tt.wantErr)
+			}
+		})
+	}
+
+	vars := validEnv()
+	vars["RATE_LIMIT_PER_SECOND"], vars["RATE_LIMIT_BURST"] = "95", "5"
+	if _, err := Load(envFrom(vars)); err != nil {
+		t.Errorf("95 + 5 rejected: %v", err)
+	}
+}
+
+func TestLoadMockProvider_Faults(t *testing.T) {
+	cfg, err := LoadMockProvider(envFrom(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxPerSecond != 100 || cfg.ServerErrorRate != DefaultMockServerErrorRate || cfg.Seed != 0 ||
+		cfg.LostResponseDelay != DefaultMockLostResponseDelay {
+		t.Errorf("defaults = %+v", cfg)
+	}
+	cfg, err = LoadMockProvider(envFrom(map[string]string{
+		"MOCK_SEED": "7", "MOCK_SERVER_ERROR_RATE": "0", "MOCK_LATENCY_MIN": "0", "MOCK_LATENCY_MAX": "0s", "MOCK_MAX_PER_SECOND": "0",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Seed != 7 || cfg.ServerErrorRate != 0 || cfg.LatencyMax != 0 || cfg.MaxPerSecond != 0 {
+		t.Errorf("overrides = %+v", cfg)
+	}
+	for key, bad := range map[string]string{
+		"MOCK_SERVER_ERROR_RATE": "1.5", "MOCK_RATE_LIMIT_RATE": "-0.1", "MOCK_LOST_RESPONSE_RATE": "often",
+		"MOCK_LATENCY_MAX": "1ms", "MOCK_SEED": "-1",
+	} {
+		if _, err := LoadMockProvider(envFrom(map[string]string{key: bad})); err == nil || !strings.Contains(err.Error(), key) {
+			t.Errorf("%s=%s: error = %v", key, bad, err)
+		}
 	}
 }
 

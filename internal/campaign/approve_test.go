@@ -197,3 +197,76 @@ func TestApprove_NoCodePathFromGeneration(t *testing.T) {
 		t.Errorf("campaign after generation = %+v", c)
 	}
 }
+
+func TestApprove_PlansDeliveriesInTheSameWrite(t *testing.T) {
+	e := newEnv(t)
+	c := e.ready(t)
+	e.approve(t, c)
+	plans := e.store.Plans(c.ID)
+	if len(plans) != 1 {
+		t.Fatalf("delivery plans = %d, want exactly one with the approval", len(plans))
+	}
+	p := plans[0]
+	if p.MaxAttempts != 4 || len(p.Channels) != len(c.Channels) || p.Predicate.SQL == "" {
+		t.Errorf("plan = %+v, want the campaign's channels, 4 attempts, a compiled predicate", p)
+	}
+	for i, ch := range c.Channels {
+		if p.Channels[i] != ch {
+			t.Errorf("plan channels = %v, want %v", p.Channels, c.Channels)
+		}
+	}
+}
+
+func TestApprove_RejectedApprovalPlansNothing(t *testing.T) {
+	e := newEnv(t)
+	c := e.ready(t)
+	stale := approvalOf(c)
+	stale.Version--
+	_, err := e.svc.Approve(t.Context(), c.ID, stale)
+	requireCode(t, err, campaign.CodeVersionConflict)
+	if plans := e.store.Plans(c.ID); len(plans) != 0 {
+		t.Errorf("rejected approval planned deliveries: %+v", plans)
+	}
+}
+
+func TestApprove_IdempotentAfterSendingStarted(t *testing.T) {
+	for _, status := range []campaign.Status{campaign.StatusSending, campaign.StatusCompleted} {
+		t.Run(string(status), func(t *testing.T) {
+			e := newEnv(t)
+			c := e.ready(t)
+			approved := e.approve(t, c)
+			approved.Status = status
+			e.store.Put(approved)
+
+			again, err := e.svc.Approve(t.Context(), c.ID, approvalOf(c))
+			if err != nil {
+				t.Fatalf("re-approve error = %v", err)
+			}
+			if again.Status != status || len(e.store.Plans(c.ID)) != 1 {
+				t.Errorf("re-approval changed state: status %s, plans %d", again.Status, len(e.store.Plans(c.ID)))
+			}
+			other := approvalOf(c)
+			other.ContentHash = strings.Repeat("1", 64)
+			_, err = e.svc.Approve(t.Context(), c.ID, other)
+			requireCode(t, err, campaign.CodeContentChanged)
+		})
+	}
+}
+
+func TestApprovedStatusesAreImmutable(t *testing.T) {
+	for _, status := range []campaign.Status{campaign.StatusSending, campaign.StatusCompleted} {
+		t.Run(string(status), func(t *testing.T) {
+			e := newEnv(t)
+			c := e.approve(t, e.ready(t))
+			c.Status = status
+			e.store.Put(c)
+			if !c.HasDrafts() || !c.Approved() {
+				t.Errorf("%s campaign: HasDrafts=%v Approved=%v, want both", status, c.HasDrafts(), c.Approved())
+			}
+			_, err := e.svc.Edit(t.Context(), c.ID, campaign.Edit{Version: c.Version, Drafts: c.Drafts, Channels: []string{"sms"}})
+			requireCode(t, err, campaign.CodeInvalidState)
+			_, err = e.svc.BeginGeneration(t.Context(), c.ID)
+			requireCode(t, err, campaign.CodeInvalidState)
+		})
+	}
+}

@@ -5,14 +5,17 @@ audience segment and SMS/email drafts. A human reviews, edits, and approves,
 and approved messages go only to fake users through a local mock provider.
 **No real SMS or email is ever sent.**
 
-> **Status: Milestone 4 (campaign approval and content).** The stack starts
+> **Status: Milestone 5 (queue and reliable delivery).** The stack starts
 > with ~5000 seeded fake users. In the browser, a marketer writes a brief
 > (Turkish or English), sees the proposed audience with per-channel counts,
 > watches SMS and email drafts stream in, edits them, previews them
 > personalized for real (fake) recipients, and explicitly approves. Approval
-> is persisted and bound to exactly the reviewed content. Claude or a
-> deterministic mock does the AI work. Delivery and the dashboard are not
-> implemented yet: approval sends nothing.
+> is persisted, bound to exactly the reviewed content, and creates one
+> delivery per consented recipient and channel. Workers send them through
+> Kafka to the local mock provider, which fails, delays, and rate-limits on
+> purpose, with retries, idempotency keys, and a shared limit of at most 100
+> messages per second per channel. Claude or a deterministic mock does the
+> AI work. The live dashboard and metrics are not implemented yet.
 
 ## Requirements
 
@@ -36,8 +39,8 @@ docker compose up --build   # or: make up (detached)
 | ------------- | ------------------------------------- | ----------------------------------- |
 | Frontend      | http://localhost:5173                 | nginx; proxies `/api/*` to the API  |
 | API           | http://localhost:8080/healthz, `/readyz` |                                  |
-| Mock provider | http://localhost:9090/healthz         | send endpoints come in Milestone 5  |
-| Worker        | internal only (`:8081/healthz`, `/readyz`) |                                |
+| Mock provider | http://localhost:9090/healthz, `/v1/stats`, `/v1/messages` | in-memory, fake recipients only |
+| Worker        | internal only (`:8081/healthz`, `/readyz`) | scale with `--scale worker=3`  |
 | Postgres, Kafka | internal Compose network only       |                                     |
 
 All published ports bind to `127.0.0.1`. Check status with `docker compose ps`.
@@ -139,10 +142,12 @@ brief:
    every problem approval would reject.
 4. **Approve.** *Approve…* asks for your name and approves exactly the
    version and content hash you reviewed. The campaign is then read-only.
-   Approval creates no delivery records or messages in this milestone.
+   The same transaction creates the deliveries (see [Delivery](#delivery)).
 
-Statuses: `draft → audience_ready → drafts_ready → approved`. The backend
-owns them; the UI only displays them.
+Statuses: `draft → audience_ready → drafts_ready → approved → sending →
+completed`. The backend owns them; the UI only displays them. `sending`
+starts when a worker claims the first delivery; `completed` means every
+delivery is `sent` or `failed`.
 
 ### Endpoints
 
@@ -257,6 +262,87 @@ Real networks count differently: any character outside the GSM-7 alphabet
 only 70 characters. A 160-character Turkish SMS can therefore be billed as
 several segments.
 
+## Delivery
+
+```
+approve ──(one transaction)──► campaigns.status = approved
+                               deliveries: one row per consented (user, channel), status queued
+                               outbox: one job message per delivery
+worker: outbox relay ──► Kafka deliveries.sms / deliveries.email (acks=all)
+worker: consumer ──► claim row (lease) ──► rate-limit token ──► consent + render + validate
+                 ──► POST mock-provider (Idempotency-Key = delivery id) ──► record outcome
+                 ──► commit offset
+worker: maintenance (every 1 s) ──► expired leases → retrying; due retries → queued + outbox;
+                                    campaigns with only sent/failed deliveries → completed
+```
+
+- **One delivery per person, channel, and campaign.** `deliveries` has
+  `UNIQUE (campaign_id, user_id, channel)`. Approving again creates nothing.
+- **Duplicates are absorbed.** A Kafka message only names a delivery. A
+  worker must claim the row (`queued`/due `retrying` → `processing`, with a
+  lease) before sending, so a redelivered message for a row that is
+  processing, sent, or failed is skipped. The attempt counter fences the
+  outcome: a worker whose lease expired cannot overwrite a newer attempt.
+- **Uncertain outcomes are retried with the same key.** After a timeout the
+  provider may already have the message; the retry sends the same
+  `Idempotency-Key` (the delivery id), and the provider returns the
+  original result instead of delivering twice.
+- **Consent and content are checked right before sending.** Consent is read
+  from the database after the rate-limit wait. Revoked consent fails the
+  delivery with `consent_revoked` without calling the provider. The message
+  is rendered for the recipient and re-validated (SMS ≤ 160 characters,
+  subject ≤ 80, no leftover `{{…}}`); a failure is `invalid_content`.
+- **Retries.** Network errors, timeouts, 408, 429, and 5xx are transient;
+  other 4xx are permanent. Transient failures wait an exponential backoff
+  with full jitter (1 s · 2^(attempt−1), capped at 60 s), or the provider's
+  `Retry-After` when longer (also capped). After 5 attempts the delivery
+  fails with `retries_exhausted`. Retries go back through the outbox, the
+  claim, and the rate limiter, like first attempts.
+- **Rate limit.** One token bucket per channel in Postgres, shared by every
+  worker and refilled by the database clock: 90 tokens/s with a burst of 5,
+  so any one-second window holds at most 95 sends per channel. Rate + burst
+  may not exceed 100 (enforced at startup).
+- **Crash recovery.** A killed worker leaves its claimed rows in
+  `processing`; when their lease (60 s) expires, maintenance moves them to
+  `retrying` (the attempt stays counted). Uncommitted Kafka messages are
+  redelivered to the other workers. On SIGTERM a worker stops polling,
+  gives in-flight sends half of `SHUTDOWN_TIMEOUT`, and commits offsets only
+  for batches that finished.
+
+Delivery statuses: `queued`, `processing`, `retrying`, `sent`, `failed`.
+Error codes in `last_error_code`: `consent_revoked`, `invalid_content`,
+`provider_rejected`, `provider_rate_limited`, `provider_unavailable`,
+`provider_timeout`, `provider_invalid_response`, `interrupted`,
+`internal_error`, `lease_expired`, `retries_exhausted`.
+
+Run several workers and watch a campaign:
+
+```bash
+docker compose up -d --scale worker=3
+docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
+  "SELECT channel, status, count(*) FROM deliveries GROUP BY 1, 2 ORDER BY 1, 2"'
+curl -s localhost:9090/v1/stats | jq .channels
+```
+
+### Mock provider
+
+`POST /v1/sms {"to","body"}` and `POST /v1/email {"to","subject","body"}`
+require an `Idempotency-Key` header. The first accepted request for a key is
+delivered; later requests with the same key return the original
+`message_id` with `"duplicate": true`. The provider only accepts the fake
+recipient ranges (`@example.com`, `+9995…`) and rejects everything else
+with 422, a second safety net behind the database constraints.
+`GET /v1/messages?channel=&limit=` lists accepted messages (newest first);
+`GET /v1/stats` counts per channel: `received`, `delivered`,
+`duplicates_suppressed`, `duplicate_content` (the same message delivered to
+the same person under a different key; should stay 0), injected faults,
+`throttled`, and `max_per_second` (most requests in any one-second window).
+
+Faults are set with `MOCK_*` variables (see the table below). Decisions are
+a hash of `MOCK_SEED`, the idempotency key, and the attempt number for that
+key, so a fixed seed reproduces them however requests interleave. State is
+in memory: restarting the mock provider forgets delivered keys and stats.
+
 ## Commands
 
 | Command          | What it does                                                            |
@@ -277,7 +363,10 @@ go test ./internal/segment/... -run TestParse_Rejections
 go test ./internal/campaign/... -run TestGenerator_ProposeSegment_InvalidOutput
 go test ./internal/campaign/... -run TestApprove_Rejections
 go test ./internal/httpapi/... -run TestDraftStream
+go test ./internal/delivery/... -run TestProcess_ProviderErrors
+go test ./internal/mockprovider/... -run TestFaults_DeterministicWithSeed
 go test -tags=integration ./internal/platform/postgres/...   # Docker required
+go test -tags=integration ./internal/delivery/... -run TestE2E   # Postgres + Kafka + mock provider
 cd frontend && npm test
 ```
 
@@ -310,12 +399,28 @@ Compose builds the service configuration from `.env` (see `.env.example`).
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | compose | — | Required; local-only credentials, URL-safe characters |
 | `LOG_LEVEL`          | all                | `info`   | `debug`, `info`, `warn`, `error`                  |
 | `SHUTDOWN_TIMEOUT`   | all                | `10s`    | Graceful shutdown bound, max `60s`                |
+| `DELIVERY_MAX_ATTEMPTS` | api, worker     | `5`      | Attempts per delivery incl. the first (1–20), stored at approval |
+| `PROVIDER_TIMEOUT`   | worker             | `5s`     | Per provider request                              |
+| `RETRY_BASE_DELAY`, `RETRY_MAX_DELAY`, `RETRY_BACKOFF_FACTOR` | worker | `1s`, `60s`, `2` | Backoff with full jitter; the cap also bounds `Retry-After` |
+| `DELIVERY_LEASE`     | worker             | `60s`    | Claim lease; at least 2 × `PROVIDER_TIMEOUT`      |
+| `WORKER_CONCURRENCY` | worker             | `16`     | Messages processed concurrently per worker        |
+| `RATE_LIMIT_PER_SECOND`, `RATE_LIMIT_BURST` | worker | `90`, `5` | Shared token bucket per channel; sum ≤ 100 |
+| `KAFKA_TOPIC_PARTITIONS` | worker         | `6`      | Partitions of the delivery topics (created at startup) |
+| `MOCK_SEED`          | mock-provider      | `0`      | Fault seed; `0` picks a random one at start       |
+| `MOCK_LATENCY_MIN`, `MOCK_LATENCY_MAX` | mock-provider | `10ms`, `80ms` | Uniform latency per accepted message |
+| `MOCK_RATE_LIMIT_RATE`, `MOCK_RETRY_AFTER` | mock-provider | `0.06`, `1s` | Injected 429s and their `Retry-After` |
+| `MOCK_SERVER_ERROR_RATE` | mock-provider  | `0.08`   | Injected 503s                                     |
+| `MOCK_PERMANENT_FAILURE_RATE` | mock-provider | `0.01` | Share of recipients always rejected with 422  |
+| `MOCK_LOST_RESPONSE_RATE`, `MOCK_LOST_RESPONSE_DELAY` | mock-provider | `0.03`, `8s` | Stored, then the response stalls (longer than `PROVIDER_TIMEOUT`) and ends in 504 |
+| `MOCK_MAX_PER_SECOND` | mock-provider     | `100`    | The provider's own per-channel limit (429); `0` disables |
 | `SEED_USER_COUNT`    | seed               | `5000`   | 1–100000; applied only to an empty database       |
 | `SEED_RANDOM_SEED`   | seed               | `20261022` | Same value ⇒ same data                          |
 | `API_PORT`, `MOCK_PROVIDER_PORT`, `FRONTEND_PORT` | compose | `8080`, `9090`, `5173` | Host ports |
 
 Set inside `docker-compose.yml`, so not needed in `.env`: `DATABASE_URL`,
 `KAFKA_BROKERS`, `API_HTTP_ADDR`, `WORKER_HEALTH_ADDR`, `MOCK_PROVIDER_ADDR`,
+`PROVIDER_URL` (default `http://mock-provider:9090`), `OUTBOX_POLL_INTERVAL`
+(`200ms`), `OUTBOX_BATCH_SIZE` (`500`), `DELIVERY_SCAN_INTERVAL` (`1s`),
 `READINESS_TIMEOUT` (default `2s`), and `HTTP_REQUEST_TIMEOUT` (default
 `30s`; campaign creation instead gets `LLM_MAX_ATTEMPTS ×` the longer LLM
 timeout plus 5 s, and the draft stream has no request timeout but the same
@@ -326,16 +431,18 @@ variable. Secret values are never echoed.
 ## Architecture
 
 ```
-browser ──► frontend (nginx) ──/api──► api ──► postgres
-                                        └────► kafka ◄──── worker ──► mock-provider
+browser ──► frontend (nginx) ──/api──► api ──► postgres ◄──────────┐
+                                                (approval writes      │ claims, rate limit,
+                                                 deliveries + outbox) │ outcomes
+                                     kafka ◄── outbox relay ── worker(s) ──► mock-provider
    migrate (one-shot) ──► seed (one-shot) ──► postgres
 ```
 
 ```
 cmd/api            API entry point (chi router, /healthz, /readyz, /api/v1)
-cmd/worker         worker entry point (dependency wait, probe server)
+cmd/worker         worker entry point (outbox relay, consumer, maintenance, probes)
 cmd/seed           one-shot fake-data loader
-mock-provider/     mock SMS/email provider (only /healthz so far)
+mock-provider/     mock SMS/email provider entry point
 internal/
   config           env loading + validation, redacting Secret type
   health           liveness/readiness handlers, concurrent checks
@@ -343,21 +450,28 @@ internal/
   campaign         state machine, edits, generation lease, preview, approval (Service);
                    AI generation: brief validation, output decoding, repair loop (Generator)
   campaign/campaigntest  in-memory Store and AudienceInspector fakes for unit tests
-  content          drafts, {{variable}} templates, channel limits, plain-text checks
+  content          drafts, {{variable}} templates, channel limits, plain-text checks,
+                   per-recipient rendering with final validation
+  delivery         claim → rate limit → consent/render → send → record (Processor);
+                   retry policy, shared-bucket limiter, outbox relay, maintenance loops
+  mockprovider     the mock provider's API: idempotency, fake-recipient guard, faults
   llm              LLM port (interface, request types, errors)
   llm/mockllm      deterministic keyword mock with scripted test faults
   strictjson       strict JSON decoding (duplicate keys, unknown fields, trailing data)
   seed             deterministic fake-data generator + transactional loader
   httpapi          /api/v1 handlers (segment preview, campaigns, SSE draft stream)
-  worker           worker lifecycle
+  worker           worker lifecycle: dependency wait, setup, long-running tasks
   platform/
     httpserver     server timeouts, middleware, graceful shutdown, probe client
     logging        slog JSON logger
     postgres       pgx pool, health checker, audience repository (consent filter),
-                   campaign store (row lock + version check, audit events)
-    kafka          franz-go client + health checker
+                   campaign store (row lock + version check, audit events, delivery
+                   materialization), delivery store (claim/lease, outbox), token bucket
+    kafka          franz-go client, health checker, topic setup, publisher, consumer group
+    provider       HTTP client for the mock provider (error classification, Retry-After)
     claude         Claude API adapter (anthropic-sdk-go, structured outputs, streaming)
   testutil/pgtest  testcontainers Postgres + migrations (integration tag)
+  testutil/kafkatest  testcontainers Kafka (apache/kafka, KRaft; integration tag)
 migrations/        versioned SQL (golang-migrate)
 frontend/          Vue 3 + TypeScript (strict) + Vite + vue-router, Vitest, ESLint
   src/api          typed client, runtime response guards, fetch-based SSE reader
@@ -365,9 +479,10 @@ frontend/          Vue 3 + TypeScript (strict) + Vite + vue-router, Vitest, ESLi
 ```
 
 Dependencies flow inward. Entry points wire the platform adapters. The
-`segment`, `content`, `llm`, and `campaign` packages import neither HTTP,
-database, nor LLM SDK code. The Postgres repository, the Claude adapter,
-and the HTTP handlers depend on them, not the reverse. See [DECISIONS.md](DECISIONS.md) for the reasoning
+`segment`, `content`, `llm`, `campaign`, and `delivery` packages import
+neither HTTP, database, queue, nor LLM SDK code. The Postgres and Kafka
+adapters, the provider and Claude clients, and the HTTP handlers depend on
+them, not the reverse. See [DECISIONS.md](DECISIONS.md) for the reasoning
 behind each choice.
 
 ## Troubleshooting
@@ -386,6 +501,13 @@ behind each choice.
   outcome and the validation problems. Briefs and generated text are never
   logged. `LLM_PROVIDER: claude requires ANTHROPIC_API_KEY` at startup
   means the provider was forced without a key.
+- **A campaign stays in `sending`**: check `docker compose ps worker` and
+  `docker compose logs worker`. Deliveries in `retrying` wait for
+  `next_attempt_at`; deliveries stuck in `processing` are recovered when
+  their lease (`DELIVERY_LEASE`, 60 s) expires.
+- **`make test` reports a Kafka container that never starts**: the
+  integration tests pull `apache/kafka:4.3.2`; the first run can take a
+  minute.
 - **Changing Postgres credentials after the first start** has no effect on
   the existing volume. Reset it with `docker compose down -v` (deletes local
   data).
@@ -411,15 +533,37 @@ behind each choice.
   The UI only offers generation before the first drafts exist.
 - Content limits are checked twice: against fixed worst-case variable
   lengths (first name 30, city 20) and, at approval, against the longest
-  real values in the audience. Per-recipient rendering right before
-  delivery comes with Milestone 5.
+  real values in the audience, and per recipient right before sending.
 - Audience counts are a snapshot taken at creation. Approval re-checks the
   live audience, but the stored counts are not refreshed.
 - If an API process dies mid-generation, the campaign's generation lease
   blocks a new generation until it expires (generation timeout + 15 s).
 - SMS limits count characters, not GSM-7/UCS-2 segments (see above).
+- Delivery is effectively-once only because the provider honours the
+  idempotency key. A provider without idempotency support could deliver
+  twice when a response is lost or a lease expires mid-send. The mock
+  provider keeps its keys in memory, so restarting it during a campaign
+  loses that protection.
+- The audience is fixed at approval. Users who gain consent later are not
+  added; users who revoke it are skipped at send time.
+- The rate limit is enforced when a token is taken, not when the provider
+  receives the request; network jitter can move a few requests into the
+  next second. The defaults (90 + 5) leave headroom below 100.
+- A delivery whose lease expires on its last attempt fails with
+  `retries_exhausted` even if the provider accepted that attempt.
+- There is no way to cancel or pause a sending campaign.
+- Failed deliveries stay as `failed` rows; there is no dead-letter topic
+  and no manual retry.
+- Published outbox rows are deleted after 24 hours.
+- A worker retries a message whose handling fails (for example while
+  Postgres is down) until it succeeds, and holds its consumer-group
+  rebalance meanwhile; other workers keep their partitions but cannot take
+  over the stuck worker's until it recovers or is stopped.
+- An attempt interrupted by shutdown is given back, so repeated restarts
+  in the middle of sends can make more than `DELIVERY_MAX_ATTEMPTS`
+  provider calls for one delivery (all with the same idempotency key).
 
 ## Not yet implemented
 
-Everything after Milestone 4: delivery records, queueing and sending
-through the mock provider, metrics, and the live dashboard.
+Everything after Milestone 5: Prometheus metrics, the live delivery
+dashboard, and campaign progress in the UI.

@@ -32,6 +32,19 @@ type UpdateFunc func(ctx context.Context, audience AudienceInspector, c Campaign
 type Write struct {
 	Campaign Campaign
 	Events   []Event
+	// Deliveries, when set, creates the campaign's deliveries and queues
+	// them in the same transaction.
+	Deliveries *DeliveryPlan
+}
+
+// DeliveryPlan materializes an approved campaign's audience: one delivery
+// per user matching Predicate who granted consent for the channel, for
+// each channel, with its queue message in the outbox. Existing deliveries
+// are kept, so applying a plan twice creates nothing new.
+type DeliveryPlan struct {
+	Predicate   segment.Predicate
+	Channels    []content.Channel
+	MaxAttempts int
 }
 
 // Store errors.

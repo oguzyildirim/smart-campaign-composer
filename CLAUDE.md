@@ -47,10 +47,11 @@ not `./...`: `frontend/node_modules` contains stray `.go` files.
 ## Repository Layout
 
 - `cmd/api`, `cmd/worker`, `cmd/seed` — entry points (wiring only).
-- `mock-provider/` — local mock SMS/email provider (own main package).
+- `mock-provider/` — local mock SMS/email provider (own main package;
+  logic in `internal/mockprovider`).
 - `internal/config` — env configuration, validation, redacting `Secret` type.
 - `internal/health` — liveness/readiness handlers and the `Checker` interface.
-- `internal/worker` — worker lifecycle.
+- `internal/worker` — worker lifecycle (dependency wait, setup, tasks).
 - `internal/segment` — domain: segment rule DSL (strict parse/validate,
   compile to parameterized SQL), preview service, `AudienceCounter` port.
 - `internal/campaign` — domain: campaign state machine, edits, generation
@@ -60,7 +61,13 @@ not `./...`: `frontend/node_modules` contains stray `.go` files.
   draft-field extraction for streaming. `internal/campaign/campaigntest` —
   in-memory fakes of its ports for unit tests.
 - `internal/content` — drafts, `{{variable}}` templates, channel limits,
-  plain-text checks.
+  plain-text checks, per-recipient rendering with final validation.
+- `internal/delivery` — domain: delivery processing (claim, rate limit,
+  consent/render, send, record), retry policy, shared-bucket limiter,
+  outbox relay and maintenance loops; `Store`/`Provider`/`RateLimiter`/
+  `Outbox`/`Publisher` ports.
+- `internal/mockprovider` — the mock provider's HTTP API: idempotency,
+  fake-recipient guard, deterministic fault injection, stats.
 - `internal/llm` — LLM port (interface, request types, errors);
   `internal/llm/mockllm` — deterministic mock with scripted test faults.
 - `internal/strictjson` — strict JSON decoding for untrusted input.
@@ -69,10 +76,13 @@ not `./...`: `frontend/node_modules` contains stray `.go` files.
   SSE draft stream); map domain errors to status codes.
 - `internal/platform/` — infrastructure adapters: `httpserver`, `logging`,
   `postgres` (pool, health, audience repository with consent filter,
-  campaign store),
-  `kafka`, `claude` (Claude API adapter). Domain packages live under
-  `internal/` and must not import HTTP or infrastructure code.
-- `internal/testutil/` — integration-test helpers (`integration` build tag).
+  campaign store, delivery store with claim/lease and outbox, token bucket),
+  `kafka` (client, topic setup, publisher, consumer group),
+  `provider` (HTTP client for the mock provider), `claude` (Claude API
+  adapter). Domain packages live under `internal/` and must not import
+  HTTP or infrastructure code.
+- `internal/testutil/` — integration-test helpers (`integration` build tag):
+  `pgtest` (Postgres), `kafkatest` (Kafka).
 - `migrations/` — versioned SQL migrations (golang-migrate).
 - `frontend/` — Vue 3 + TypeScript + Vite + vue-router application
   (Vitest, ESLint); `src/api` holds the typed API client, response guards,

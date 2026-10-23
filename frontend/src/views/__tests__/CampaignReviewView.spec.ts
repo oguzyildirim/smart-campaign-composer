@@ -231,6 +231,19 @@ describe('CampaignReviewView', () => {
     expect(wrapper.get('#field-email_subject').attributes('readonly')).toBeDefined()
   })
 
+  it.each(['sending', 'completed'] as const)('renders %s campaigns read-only with their status', async (status) => {
+    stubFetch({
+      [`GET ${path}`]: () =>
+        jsonResponse(campaignJSON({ status, approved_by: 'Deniz', approved_at: '2026-10-22T12:05:00Z' })),
+      [`GET ${path}/preview`]: () => jsonResponse(previewJSON()),
+    })
+    const wrapper = await mountView()
+    expect(wrapper.get(`[data-status="${status}"]`).text()).toBe(status === 'sending' ? 'Sending' : 'Completed')
+    expect(wrapper.find('[data-testid="approved-banner"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="approve"]').exists()).toBe(false)
+    expect(wrapper.get('#field-sms_body').attributes('readonly')).toBeDefined()
+  })
+
   it('shows load errors', async () => {
     stubFetch({ [`GET ${path}`]: () => errorResponse(404, 'not_found', 'campaign not found') })
     const wrapper = await mountView()

@@ -18,6 +18,9 @@ type ServiceConfig struct {
 	GenerationTimeout time.Duration
 	// PreviewSamples is the number of recipients rendered per channel.
 	PreviewSamples int
+	// DeliveryMaxAttempts is the attempt limit of each delivery created at
+	// approval.
+	DeliveryMaxAttempts int
 }
 
 // ListLimit is the number of campaigns List returns.
