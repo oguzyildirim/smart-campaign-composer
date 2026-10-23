@@ -116,6 +116,15 @@ func TestLoad_Invalid(t *testing.T) {
 		{"negative duration", "READINESS_TIMEOUT", "-1s", "READINESS_TIMEOUT: must be greater than 0"},
 		{"duration above max", "SHUTDOWN_TIMEOUT", "2m", "at most 1m0s"},
 		{"request timeout above max", "HTTP_REQUEST_TIMEOUT", "1h", "HTTP_REQUEST_TIMEOUT: must be greater than 0"},
+		{"unknown llm provider", "LLM_PROVIDER", "openai", "LLM_PROVIDER: must be one of mock, claude"},
+		{"claude without key", "LLM_PROVIDER", "claude", "LLM_PROVIDER: claude requires ANTHROPIC_API_KEY"},
+		{"model with spaces", "ANTHROPIC_MODEL", "claude sonnet", "ANTHROPIC_MODEL: must be a model id"},
+		{"model with path", "ANTHROPIC_MODEL", "../claude", "ANTHROPIC_MODEL: must be a model id"},
+		{"segment timeout above max", "LLM_SEGMENT_TIMEOUT", "10m", "LLM_SEGMENT_TIMEOUT: must be greater than 0"},
+		{"drafts timeout zero", "LLM_DRAFTS_TIMEOUT", "0s", "LLM_DRAFTS_TIMEOUT: must be greater than 0"},
+		{"zero attempts", "LLM_MAX_ATTEMPTS", "0", "LLM_MAX_ATTEMPTS: must be an integer between 1 and 3"},
+		{"too many attempts", "LLM_MAX_ATTEMPTS", "4", "LLM_MAX_ATTEMPTS: must be an integer between 1 and 3"},
+		{"negative sdk retries", "LLM_SDK_MAX_RETRIES", "-1", "LLM_SDK_MAX_RETRIES: must be an integer between 0 and 5"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -130,6 +139,75 @@ func TestLoad_Invalid(t *testing.T) {
 				t.Errorf("Load() error = %q, want it to contain %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestLoad_LLM(t *testing.T) {
+	tests := []struct {
+		name         string
+		env          map[string]string
+		wantProvider LLMProvider
+	}{
+		{"no key selects mock", nil, LLMProviderMock},
+		{"key selects claude", map[string]string{"ANTHROPIC_API_KEY": "sk-test"}, LLMProviderClaude},
+		{"explicit mock wins over key", map[string]string{"ANTHROPIC_API_KEY": "sk-test", "LLM_PROVIDER": "mock"}, LLMProviderMock},
+		{"explicit claude with key", map[string]string{"ANTHROPIC_API_KEY": "sk-test", "LLM_PROVIDER": "claude"}, LLMProviderClaude},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := validEnv()
+			for k, v := range tt.env {
+				env[k] = v
+			}
+			cfg, err := Load(envFrom(env))
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.LLM.Provider != tt.wantProvider {
+				t.Errorf("Provider = %q, want %q", cfg.LLM.Provider, tt.wantProvider)
+			}
+		})
+	}
+
+	cfg, err := Load(envFrom(validEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := LLMConfig{
+		Provider: LLMProviderMock, Model: DefaultAnthropicModel,
+		SegmentTimeout: DefaultLLMSegmentTimeout, DraftsTimeout: DefaultLLMDraftsTimeout,
+		MaxAttempts: DefaultLLMMaxAttempts, SDKMaxRetries: DefaultLLMSDKMaxRetries,
+	}
+	if cfg.LLM != want {
+		t.Errorf("LLM defaults = %+v, want %+v", cfg.LLM, want)
+	}
+
+	env := validEnv()
+	env["ANTHROPIC_MODEL"] = "claude-opus-5-5"
+	env["LLM_SEGMENT_TIMEOUT"] = "5s"
+	env["LLM_DRAFTS_TIMEOUT"] = "90s"
+	env["LLM_MAX_ATTEMPTS"] = "3"
+	env["LLM_SDK_MAX_RETRIES"] = "0"
+	cfg, err = Load(envFrom(env))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = LLMConfig{
+		Provider: LLMProviderMock, Model: "claude-opus-5-5",
+		SegmentTimeout: 5 * time.Second, DraftsTimeout: 90 * time.Second,
+		MaxAttempts: 3, SDKMaxRetries: 0,
+	}
+	if cfg.LLM != want {
+		t.Errorf("LLM overrides = %+v, want %+v", cfg.LLM, want)
+	}
+}
+
+// TestLLMConfig_RouteTimeout: the HTTP route budget must cover every
+// attempt so the service, not the router, decides when to give up.
+func TestLLMConfig_RouteTimeout(t *testing.T) {
+	c := LLMConfig{SegmentTimeout: 20 * time.Second, DraftsTimeout: 60 * time.Second, MaxAttempts: 2}
+	if got, want := c.RouteTimeout(), 2*60*time.Second+llmRouteSlack; got != want {
+		t.Errorf("RouteTimeout() = %v, want %v", got, want)
 	}
 }
 

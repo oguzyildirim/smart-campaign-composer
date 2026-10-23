@@ -182,6 +182,18 @@ func TestRouter_RequestTimeout(t *testing.T) {
 	}
 }
 
+func TestRouter_ZeroTimeoutLeavesDeadlinesToRoutes(t *testing.T) {
+	r := NewRouter(discardLogger, 0)
+	var hasDeadline bool
+	r.Get("/x", func(_ http.ResponseWriter, req *http.Request) {
+		_, hasDeadline = req.Context().Deadline()
+	})
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
+	if hasDeadline {
+		t.Error("NewRouter(_, 0) set a request deadline")
+	}
+}
+
 func TestProbe(t *testing.T) {
 	okSrv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	t.Cleanup(okSrv.Close)

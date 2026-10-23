@@ -18,13 +18,18 @@ import (
 var quietPaths = map[string]bool{"/healthz": true, "/readyz": true}
 
 // NewRouter returns a chi router with the base middleware stack: request ID,
-// panic recovery, access logging, and a per-request timeout.
+// panic recovery, access logging, and a per-request timeout. A zero
+// requestTimeout leaves timeouts to the caller, which must then apply
+// middleware.Timeout to every route group (routes that call an LLM need a
+// longer budget than the rest).
 func NewRouter(logger *slog.Logger, requestTimeout time.Duration) chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(RequestLogger(logger))
 	r.Use(Recoverer(logger))
-	r.Use(middleware.Timeout(requestTimeout))
+	if requestTimeout > 0 {
+		r.Use(middleware.Timeout(requestTimeout))
+	}
 	r.NotFound(func(w http.ResponseWriter, _ *http.Request) {
 		WriteError(w, http.StatusNotFound, "not found")
 	})

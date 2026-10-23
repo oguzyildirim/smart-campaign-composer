@@ -53,12 +53,19 @@ not `./...`: `frontend/node_modules` contains stray `.go` files.
 - `internal/worker` — worker lifecycle.
 - `internal/segment` — domain: segment rule DSL (strict parse/validate,
   compile to parameterized SQL), preview service, `AudienceCounter` port.
+- `internal/campaign` — domain: AI generation service (brief validation,
+  strict LLM-output decoding, bounded repair retry, error codes).
+- `internal/content` — drafts, `{{variable}}` templates, channel limits,
+  plain-text checks.
+- `internal/llm` — LLM port (interface, request types, errors);
+  `internal/llm/mockllm` — deterministic mock with scripted test faults.
+- `internal/strictjson` — strict JSON decoding for untrusted input.
 - `internal/seed` — deterministic fake-data generator and transactional loader.
 - `internal/httpapi` — `/api/v1` HTTP handlers; map domain errors to status codes.
 - `internal/platform/` — infrastructure adapters: `httpserver`, `logging`,
   `postgres` (pool, health, audience repository with consent filter),
-  `kafka`. Domain packages live under `internal/` and must not import
-  HTTP or infrastructure code.
+  `kafka`, `claude` (Claude API adapter). Domain packages live under
+  `internal/` and must not import HTTP or infrastructure code.
 - `internal/testutil/` — integration-test helpers (`integration` build tag).
 - `migrations/` — versioned SQL migrations (golang-migrate).
 - `frontend/` — Vue 3 + TypeScript + Vite application (Vitest, ESLint).

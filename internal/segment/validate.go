@@ -3,15 +3,15 @@ package segment
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/oguzyildirim/smart-campaign-composer/internal/strictjson"
 )
 
 // Structural limits of a rule.
@@ -113,7 +113,7 @@ func (v *validator) fail(path, format string, args ...any) {
 }
 
 func (v *validator) parse(data []byte) Rule {
-	if err := checkSyntax(data); err != nil {
+	if err := strictjson.CheckSyntax(data); err != nil {
 		v.fail("$", "%s", err)
 		return Rule{}
 	}
@@ -402,63 +402,4 @@ func joinOps(ops []Op) string {
 		names[i] = string(op)
 	}
 	return strings.Join(names, ", ")
-}
-
-// errDuplicateKey is reported when an object repeats a key. encoding/json
-// silently keeps the last occurrence, which would let a rule show one
-// value to a reviewer and apply another.
-var errDuplicateKey = errors.New("duplicate object key")
-
-// checkSyntax verifies that data is exactly one well-formed JSON value
-// with no duplicate object keys and nothing after it.
-func checkSyntax(data []byte) error {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.UseNumber()
-	if err := walkValue(dec); err != nil {
-		if errors.Is(err, errDuplicateKey) {
-			return err
-		}
-		return errors.New("malformed JSON")
-	}
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return errors.New("unexpected data after JSON value")
-	}
-	return nil
-}
-
-func walkValue(dec *json.Decoder) error {
-	tok, err := dec.Token()
-	if err != nil {
-		return err
-	}
-	delim, ok := tok.(json.Delim)
-	if !ok {
-		return nil // scalar
-	}
-	switch delim {
-	case '{':
-		keys := make(map[string]bool)
-		for dec.More() {
-			keyTok, err := dec.Token()
-			if err != nil {
-				return err
-			}
-			key, _ := keyTok.(string)
-			if keys[key] {
-				return errDuplicateKey
-			}
-			keys[key] = true
-			if err := walkValue(dec); err != nil {
-				return err
-			}
-		}
-	case '[':
-		for dec.More() {
-			if err := walkValue(dec); err != nil {
-				return err
-			}
-		}
-	}
-	_, err = dec.Token() // closing delimiter
-	return err
 }

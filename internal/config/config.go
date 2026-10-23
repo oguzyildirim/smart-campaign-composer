@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -26,10 +27,34 @@ const (
 	DefaultSeedRandomSeed   = 20261022
 	MaxSeedUserCount        = 100000
 
+	DefaultAnthropicModel    = "claude-sonnet-5-5"
+	DefaultLLMSegmentTimeout = 20 * time.Second
+	DefaultLLMDraftsTimeout  = 60 * time.Second
+	DefaultLLMMaxAttempts    = 2
+	DefaultLLMSDKMaxRetries  = 2
+
 	maxShutdownTimeout = 60 * time.Second
 	maxCheckTimeout    = 30 * time.Second
 	maxRequestTimeout  = 5 * time.Minute
+	maxLLMCallTimeout  = 3 * time.Minute
+	maxLLMAttempts     = 3
+	maxLLMSDKRetries   = 5
+	// llmRouteSlack is added to the LLM routes' timeout so the service's
+	// own per-call timeouts always fire first and produce a clean error.
+	llmRouteSlack = 5 * time.Second
 )
+
+// LLMProvider selects the language model backend.
+type LLMProvider string
+
+// Supported providers.
+const (
+	LLMProviderMock   LLMProvider = "mock"
+	LLMProviderClaude LLMProvider = "claude"
+)
+
+// modelID accepts Anthropic model ids such as claude-sonnet-5-5.
+var modelID = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{0,63}$`)
 
 // Getenv looks up an environment variable. os.Getenv satisfies it; tests
 // pass a map-backed function instead of mutating the process environment.
@@ -42,12 +67,36 @@ type Config struct {
 	KafkaBrokers     []string
 	ShutdownTimeout  time.Duration
 	ReadinessTimeout time.Duration
-	// AnthropicAPIKey is optional. When empty, later milestones use the
+	// AnthropicAPIKey is optional. When empty, the API uses the
 	// deterministic mock LLM.
 	AnthropicAPIKey Secret
 
 	API    APIConfig
 	Worker WorkerConfig
+	LLM    LLMConfig
+}
+
+// LLMConfig configures AI generation.
+type LLMConfig struct {
+	// Provider is LLM_PROVIDER, defaulting to claude when an API key is
+	// set and mock otherwise.
+	Provider LLMProvider
+	Model    string
+	// SegmentTimeout and DraftsTimeout bound each model call.
+	SegmentTimeout time.Duration
+	DraftsTimeout  time.Duration
+	// MaxAttempts is the total number of calls per request, including
+	// repair calls after invalid output.
+	MaxAttempts int
+	// SDKMaxRetries is the Claude SDK's retry count for transient HTTP
+	// errors within one call.
+	SDKMaxRetries int
+}
+
+// RouteTimeout is the request timeout for routes that call the LLM: long
+// enough for every attempt of the slower operation, plus slack.
+func (c LLMConfig) RouteTimeout() time.Duration {
+	return time.Duration(c.MaxAttempts)*max(c.SegmentTimeout, c.DraftsTimeout) + llmRouteSlack
 }
 
 // APIConfig holds settings used only by cmd/api.
@@ -97,6 +146,14 @@ func Load(getenv Getenv) (Config, error) {
 		Worker: WorkerConfig{
 			HealthAddr: p.addr("WORKER_HEALTH_ADDR", DefaultWorkerHealthAddr),
 		},
+	}
+	cfg.LLM = LLMConfig{
+		Provider:       p.llmProvider("LLM_PROVIDER", cfg.AnthropicAPIKey.IsSet()),
+		Model:          p.model("ANTHROPIC_MODEL", DefaultAnthropicModel),
+		SegmentTimeout: p.duration("LLM_SEGMENT_TIMEOUT", DefaultLLMSegmentTimeout, maxLLMCallTimeout),
+		DraftsTimeout:  p.duration("LLM_DRAFTS_TIMEOUT", DefaultLLMDraftsTimeout, maxLLMCallTimeout),
+		MaxAttempts:    p.intRange("LLM_MAX_ATTEMPTS", DefaultLLMMaxAttempts, 1, maxLLMAttempts),
+		SDKMaxRetries:  p.intRange("LLM_SDK_MAX_RETRIES", DefaultLLMSDKMaxRetries, 0, maxLLMSDKRetries),
 	}
 
 	if err := p.err(); err != nil {
@@ -266,6 +323,40 @@ func (p *parser) uint64(key string, def uint64) uint64 {
 		return def
 	}
 	return n
+}
+
+// llmProvider defaults to claude when an API key is configured. Choosing
+// claude explicitly without a key is an error rather than a silent mock.
+func (p *parser) llmProvider(key string, haveKey bool) LLMProvider {
+	switch raw := LLMProvider(p.get(key)); raw {
+	case "":
+		if haveKey {
+			return LLMProviderClaude
+		}
+		return LLMProviderMock
+	case LLMProviderMock:
+		return raw
+	case LLMProviderClaude:
+		if !haveKey {
+			p.fail(key, "claude requires ANTHROPIC_API_KEY")
+		}
+		return raw
+	default:
+		p.fail(key, "must be one of mock, claude")
+		return LLMProviderMock
+	}
+}
+
+func (p *parser) model(key, def string) string {
+	raw := p.get(key)
+	if raw == "" {
+		return def
+	}
+	if !modelID.MatchString(raw) {
+		p.fail(key, "must be a model id such as %s", def)
+		return def
+	}
+	return raw
 }
 
 func validPort(port string) bool {

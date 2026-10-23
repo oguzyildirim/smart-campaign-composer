@@ -6,9 +6,7 @@ package httpapi
 import (
 	"context"
 	"errors"
-	"io"
 	"log/slog"
-	"mime"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -52,18 +50,9 @@ type segmentHandler struct {
 }
 
 func (h segmentHandler) preview(w http.ResponseWriter, r *http.Request) {
-	if mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mediaType != "application/json" {
-		httpserver.WriteError(w, http.StatusUnsupportedMediaType, "content type must be application/json")
-		return
-	}
-
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxSegmentBodyBytes))
-	if err != nil {
-		if _, tooLarge := errors.AsType[*http.MaxBytesError](err); tooLarge {
-			httpserver.WriteError(w, http.StatusBadRequest, "request body too large")
-			return
-		}
-		httpserver.WriteError(w, http.StatusBadRequest, "could not read request body")
+	body, status, msg := readJSONBody(w, r, MaxSegmentBodyBytes)
+	if status != 0 {
+		httpserver.WriteError(w, status, msg)
 		return
 	}
 
