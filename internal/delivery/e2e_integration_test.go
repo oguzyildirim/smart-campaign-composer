@@ -13,19 +13,15 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/oguzyildirim/smart-campaign-composer/internal/campaign"
-	"github.com/oguzyildirim/smart-campaign-composer/internal/content"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/delivery"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/llm/mockllm"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/mockprovider"
-	"github.com/oguzyildirim/smart-campaign-composer/internal/platform/kafka"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/platform/postgres"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/platform/provider"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/seed"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/segment"
-	"github.com/oguzyildirim/smart-campaign-composer/internal/testutil/kafkatest"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/testutil/pgtest"
 )
 
@@ -36,6 +32,7 @@ var logger = slog.New(slog.DiscardHandler)
 // e2e is an approved example campaign over seeded fake users, with a mock
 // provider configured by the test.
 type e2e struct {
+	dsn      string
 	pool     *pgxpool.Pool
 	store    *postgres.DeliveryStore
 	campaign campaign.Campaign
@@ -43,6 +40,8 @@ type e2e struct {
 	proc     *delivery.Processor
 	limiter  *delivery.Limiter
 	client   *provider.Client
+	// requests logs every request the mock provider receives.
+	requests *requestLog
 }
 
 // testPolicy keeps retries fast; its cap also bounds Retry-After.
@@ -52,9 +51,16 @@ func (e e2e) processor(policy delivery.RetryPolicy) *delivery.Processor {
 	return delivery.NewProcessor(e.store, e.limiter, e.client, delivery.ProcessorConfig{Lease: 5 * time.Second, Policy: policy}, logger)
 }
 
-// newE2E seeds users, approves the example campaign through the real
-// service, and wires a processor to a mock provider with faults.
+// newE2E seeds 400 users (about 40 deliveries), approves the example
+// campaign through the real service, and wires a processor to a mock
+// provider with faults.
 func newE2E(t *testing.T, faults mockprovider.Config, rate, burst int) e2e {
+	t.Helper()
+	return newE2EWithUsers(t, 400, faults, rate, burst)
+}
+
+// newE2EWithUsers is newE2E over a larger or smaller seed.
+func newE2EWithUsers(t *testing.T, users int, faults mockprovider.Config, rate, burst int) e2e {
 	t.Helper()
 	dsn := pgtest.Start(t)
 	pgtest.Migrate(t, dsn)
@@ -64,7 +70,7 @@ func newE2E(t *testing.T, faults mockprovider.Config, rate, burst int) e2e {
 	}
 	t.Cleanup(pool.Close)
 	now := time.Now()
-	if _, err := seed.Load(t.Context(), pool, seed.Generate(seed.Options{UserCount: 400, RandomSeed: 1, Now: now})); err != nil {
+	if _, err := seed.Load(t.Context(), pool, seed.Generate(seed.Options{UserCount: users, RandomSeed: 1, Now: now})); err != nil {
 		t.Fatal(err)
 	}
 
@@ -94,13 +100,14 @@ func newE2E(t *testing.T, faults mockprovider.Config, rate, burst int) e2e {
 	if faults.Seed == 0 {
 		faults.Seed = 11
 	}
-	mock := httptest.NewServer(mockprovider.New(faults, logger).Handler())
+	requests := &requestLog{}
+	mock := httptest.NewServer(requests.wrap(mockprovider.New(faults, logger).Handler()))
 	t.Cleanup(mock.Close)
 	client, err := provider.New(mock.URL, 300*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := e2e{pool: pool, store: postgres.NewDeliveryStore(pool), campaign: c, mock: mock, client: client,
+	e := e2e{dsn: dsn, requests: requests, pool: pool, store: postgres.NewDeliveryStore(pool), campaign: c, mock: mock, client: client,
 		limiter: delivery.NewLimiter(postgres.NewTokenBucket(pool, rate, burst))}
 	e.proc = e.processor(testPolicy)
 	return e
@@ -199,9 +206,10 @@ func checkInvariants(t *testing.T, e e2e) {
 		switch {
 		case r.status == "sent":
 			sent[r.channel]++
-		case r.status == "failed" && (r.code == delivery.CodeRetriesExhausted || r.code == delivery.CodeRejected):
+		case r.status == "failed" && (r.code == delivery.CodeRetriesExhausted || r.code == delivery.CodeRejected ||
+			r.code == delivery.CodeConsentRevoked):
 		default:
-			t.Errorf("delivery %+v: want sent, or failed by a permanent error or exhausted retries", r)
+			t.Errorf("delivery %+v: want sent, or failed by a permanent error, revoked consent, or exhausted retries", r)
 		}
 		if r.attempts > 5 {
 			t.Errorf("delivery %s made %d attempts, max 5", r.id, r.attempts)
@@ -215,6 +223,7 @@ func checkInvariants(t *testing.T, e e2e) {
 			t.Errorf("%s: %d recipients got the same message twice", ch, st.DuplicateContent)
 		}
 	}
+	checkOnePerRecipient(t, e)
 }
 
 func TestE2E_TransientFailuresAreRetriedUntilSent(t *testing.T) {
@@ -325,38 +334,11 @@ func TestE2E_PipelineWithKafka(t *testing.T) {
 		ServerErrorRate: 0.1, RateLimitRate: 0.05, RetryAfter: time.Second, PermanentFailureRate: 0.02,
 		LostResponseRate: 0.05, LostResponseDelay: 500 * time.Millisecond, MaxPerSecond: 100,
 	}, rate, burst)
-	brokers := kafkatest.Start(t)
-	producer, err := kafka.NewClient(brokers, kafka.ProducerOpts()...)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(producer.Close)
-	topics := []string{delivery.Topic(content.ChannelSMS), delivery.Topic(content.ChannelEmail)}
-	if err := kafka.EnsureTopics(t.Context(), producer, 3, topics...); err != nil {
-		t.Fatal(err)
-	}
+	brokers := startKafka(t)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	g, gctx := errgroup.WithContext(ctx)
-	for i := range 3 {
-		consumer, err := kafka.NewConsumer(kafka.ConsumerConfig{
-			Brokers: brokers, Group: "e2e", Topics: topics, Concurrency: 4, MaxPollRecords: 16, Grace: time.Second,
-		}, e.proc.Handle, logger)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(consumer.Close)
-		g.Go(func() error { return consumer.Run(gctx) })
-		g.Go(func() error {
-			return delivery.RunRelay(gctx, e.store, kafka.NewPublisher(producer),
-				delivery.RelayConfig{BatchSize: 10 + i, PollInterval: 50 * time.Millisecond}, logger)
-		})
-		g.Go(func() error {
-			return delivery.RunMaintenance(gctx, e.store,
-				delivery.MaintenanceConfig{Interval: 100 * time.Millisecond, BatchSize: 50, OutboxRetention: time.Hour}, logger)
-		})
-	}
+	wait := startWorkers(ctx, t, e, brokers, 3)
 
 	deadline := time.Now().Add(120 * time.Second)
 	for e.campaignStatus(t) != "completed" {
@@ -397,7 +379,7 @@ func TestE2E_PipelineWithKafka(t *testing.T) {
 		}
 	}
 	cancel()
-	if err := g.Wait(); err != nil {
+	if err := wait(); err != nil {
 		t.Errorf("workers: %v", err)
 	}
 	t.Logf("deliveries: %d; provider stats: %+v", len(e.rows(t)), fmt.Sprint(after.Channels))

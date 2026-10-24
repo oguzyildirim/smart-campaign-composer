@@ -36,6 +36,10 @@ Never list a command that does not work.
   tests; Docker required) and frontend tests; no `ANTHROPIC_API_KEY` needed.
 - `make test-unit` — Go unit tests (`-race`) and frontend tests; no Docker.
 - `make lint` — golangci-lint (pinned, installed into `bin/`), ESLint, vue-tsc.
+- `make vuln` — govulncheck (pinned, installed into `bin/`; needs network).
+- `make fuzz` — run each Go fuzz target for `FUZZTIME` (default 30s).
+- `make smoke` — example campaign end to end against the running stack
+  (`API_PORT=` / `MOCK_PROVIDER_PORT=` if changed in `.env`).
 - `make fmt` — gofmt + goimports.
 - `go test ./internal/<pkg>/... -run <TestName>` — run a single Go test
   (add `-tags=integration` for integration tests).
@@ -47,6 +51,8 @@ not `./...`: `frontend/node_modules` contains stray `.go` files.
 ## Repository Layout
 
 - `cmd/api`, `cmd/worker`, `cmd/seed` — entry points (wiring only).
+- `cmd/smoke` — end-to-end check against the running stack (`make smoke`);
+  not built into an image.
 - `mock-provider/` — local mock SMS/email provider (own main package;
   logic in `internal/mockprovider`).
 - `internal/config` — env configuration, validation, redacting `Secret` type.

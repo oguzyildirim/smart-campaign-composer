@@ -1,0 +1,4 @@
+go test fuzz v1
+string("{{first_name}}{{first_name}}")
+string("\x9f\xd0")
+string("0")

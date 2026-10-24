@@ -6,6 +6,8 @@ SHELL := /bin/bash
 
 GOLANGCI_LINT_VERSION := v2.15.0
 GOLANGCI_LINT := bin/golangci-lint-$(GOLANGCI_LINT_VERSION)
+GOVULNCHECK_VERSION := v1.9.0
+GOVULNCHECK := bin/govulncheck-$(GOVULNCHECK_VERSION)
 # Build the linter with the toolchain pinned in go.mod so it understands
 # the project's Go version.
 GO_TOOLCHAIN := $(shell sed -n 's/^toolchain //p' go.mod)
@@ -35,6 +37,15 @@ down: ## Stop the stack (keeps volumes)
 
 ## --- Tests -------------------------------------------------------------
 
+# Host ports of the running stack; match API_PORT and MOCK_PROVIDER_PORT
+# in .env if you changed them (make smoke API_PORT=...).
+API_PORT ?= 8080
+MOCK_PROVIDER_PORT ?= 9090
+
+.PHONY: smoke
+smoke: ## Run the example campaign end to end against the running stack
+	go run ./cmd/smoke -api http://127.0.0.1:$(API_PORT) -provider http://127.0.0.1:$(MOCK_PROVIDER_PORT)
+
 .PHONY: test
 test: test-go test-frontend ## Run all tests (Docker required for integration tests)
 
@@ -53,6 +64,18 @@ test-go: ## All Go tests, unit + integration (testcontainers; Docker required)
 test-frontend: $(FRONTEND_DEPS) ## Frontend unit tests (Vitest)
 	cd frontend && npm test
 
+# Fuzz targets as package:Name; `make test` runs their seed corpora.
+FUZZ_TARGETS := ./internal/segment:FuzzParse \
+	./internal/content:FuzzParseTemplate ./internal/content:FuzzRenderMessage \
+	./internal/campaign:FuzzDecodeSegmentOutput ./internal/campaign:FuzzDecodeDrafts
+FUZZTIME ?= 30s
+
+.PHONY: fuzz
+fuzz: ## Fuzz each target for FUZZTIME (default 30s)
+	@set -e; for t in $(FUZZ_TARGETS); do \
+		echo "--- $${t#*:}"; go test -run '^$$' -fuzz "^$${t#*:}$$" -fuzztime $(FUZZTIME) "$${t%%:*}"; \
+	done
+
 ## --- Quality -----------------------------------------------------------
 
 .PHONY: lint
@@ -66,6 +89,10 @@ lint-go: $(GOLANGCI_LINT) ## golangci-lint (includes go vet)
 lint-frontend: $(FRONTEND_DEPS) ## ESLint and vue-tsc
 	cd frontend && npm run lint && npm run typecheck
 
+.PHONY: vuln
+vuln: $(GOVULNCHECK) ## Report known vulnerabilities in reachable Go code (network)
+	$(GOVULNCHECK) $(GO_PKGS)
+
 .PHONY: fmt
 fmt: $(GOLANGCI_LINT) ## Format Go code (gofmt + goimports)
 	$(GOLANGCI_LINT) fmt $(GO_PKGS)
@@ -77,6 +104,12 @@ $(GOLANGCI_LINT):
 	GOBIN=$(CURDIR)/bin/.tmp GOTOOLCHAIN=$(GO_TOOLCHAIN) \
 		go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 	mv bin/.tmp/golangci-lint $@ && rmdir bin/.tmp
+
+$(GOVULNCHECK):
+	@mkdir -p bin
+	GOBIN=$(CURDIR)/bin/.tmp GOTOOLCHAIN=$(GO_TOOLCHAIN) \
+		go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
+	mv bin/.tmp/govulncheck $@ && rmdir bin/.tmp
 
 $(FRONTEND_DEPS): frontend/package-lock.json
 	cd frontend && npm ci
