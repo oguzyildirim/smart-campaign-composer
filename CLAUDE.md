@@ -41,6 +41,7 @@ Never list a command that does not work.
 - `make smoke` — example campaign end to end against the running stack
   (`API_PORT=` / `MOCK_PROVIDER_PORT=` if changed in `.env`).
 - `make fmt` — gofmt + goimports.
+- `make fmt-check` — fail (printing the diff) if Go code is not formatted.
 - `go test ./internal/<pkg>/... -run <TestName>` — run a single Go test
   (add `-tags=integration` for integration tests).
 - `cd frontend && npm test` — frontend unit tests.
@@ -95,6 +96,9 @@ not `./...`: `frontend/node_modules` contains stray `.go` files.
 - `internal/testutil/` — integration-test helpers (`integration` build tag):
   `pgtest` (Postgres), `kafkatest` (Kafka).
 - `migrations/` — versioned SQL migrations (golang-migrate).
+- `.github/workflows/ci.yml` — CI: `make fmt-check`, `make lint`,
+  `make vuln`, `make test`, and a build of every Compose image (no push,
+  no deploy).
 - `frontend/` — Vue 3 + TypeScript + Vite + vue-router application
   (Vitest, ESLint); `src/api` holds the typed API client, response guards,
   and SSE reader; `src/composables` shared state (draft stream, campaign

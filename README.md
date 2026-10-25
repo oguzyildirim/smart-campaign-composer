@@ -62,6 +62,7 @@ Every long-running service reports `healthy`, and the one-shot `migrate` and
 | `make lint`      | golangci-lint, ESLint, and vue-tsc                                      |
 | `make vuln`      | govulncheck (pinned, installed into `bin/`; needs network)              |
 | `make fmt`       | gofmt + goimports                                                       |
+| `make fmt-check` | Fail (and print the diff) if Go code is not formatted                   |
 | `make help`      | List all targets                                                        |
 
 ### Smoke test
@@ -491,6 +492,26 @@ deterministic mock LLM or a stub HTTP server.
   compiler, the template parser and per-recipient renderer, and the LLM
   output decoders. `make test` runs their seed corpora; `make fuzz` fuzzes.
 
+### CI
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on pushes to `master`,
+pull requests, and manual dispatch. Its jobs run in parallel, and each one
+calls a Makefile target, so a failure can be reproduced locally:
+
+- **Format check**: `make fmt-check` (gofmt + goimports).
+- **Lint**: `make lint`. That is golangci-lint with go vet, staticcheck,
+  gosec, errcheck and the other linters in `.golangci.yml`, plus ESLint and
+  vue-tsc type checking.
+- **Static analysis**: `make vuln` (govulncheck on reachable Go code).
+- **Tests**: `make test` on `ubuntu-latest`, with Go from the `go.mod`
+  toolchain and the same Node version as the frontend image. The runner's
+  Docker hosts the testcontainers.
+- **Build image**: builds each image from `docker-compose.yml` (api,
+  worker, seed, mock-provider, frontend) with Buildx and the GitHub Actions
+  cache.
+
+Nothing is pushed or deployed, and no secrets are used.
+
 
 ## Health endpoints
 
@@ -731,7 +752,9 @@ behind each choice.
 
 - Bonus items: scheduled sending, A/B variants, locale-based content (the
   mock answers in the brief's language, but there is no per-recipient
-  language), CI pipeline.
+  language).
+- CI does not run `make smoke` or check frontend formatting (no formatter
+  such as Prettier is set up), and it does not publish images or deploy.
 - Authentication and roles (see Known limitations).
 - Redis, retry or dead-letter topics: retries go through Postgres and the
   outbox; failed deliveries stay as `failed` rows.

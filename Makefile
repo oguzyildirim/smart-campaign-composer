@@ -97,6 +97,10 @@ vuln: $(GOVULNCHECK) ## Report known vulnerabilities in reachable Go code (netwo
 fmt: $(GOLANGCI_LINT) ## Format Go code (gofmt + goimports)
 	$(GOLANGCI_LINT) fmt $(GO_PKGS)
 
+.PHONY: fmt-check
+fmt-check: $(GOLANGCI_LINT) ## Fail if Go code is not formatted (prints the diff)
+	$(GOLANGCI_LINT) fmt --diff $(GO_PKGS)
+
 ## --- Tooling -----------------------------------------------------------
 
 $(GOLANGCI_LINT):

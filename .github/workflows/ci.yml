@@ -1,0 +1,159 @@
+# Continuous integration: format check, lint, static analysis, the test
+# suite, and a build of every image.
+# Nothing is pushed or deployed. No secrets are used: the tests run against
+# the deterministic mock LLM and testcontainers.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format:
+    name: Format check (make fmt-check)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      # Pinned golangci-lint and govulncheck binaries installed by the
+      # Makefile; the key changes when their versions or the toolchain do.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: bin
+          key: tools-${{ runner.os }}-${{ hashFiles('Makefile', 'go.mod') }}
+
+      # gofmt + goimports; prints the diff and fails if anything changes.
+      - run: make fmt-check
+
+  lint:
+    name: Lint (make lint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.1
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: bin
+          key: tools-${{ runner.os }}-${{ hashFiles('Makefile', 'go.mod') }}
+
+      # golangci-lint (go vet, staticcheck, gosec, errcheck, ...; see
+      # .golangci.yml), ESLint, and vue-tsc type checking.
+      - run: make lint
+
+  static-analysis:
+    name: Static analysis (make vuln)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: bin
+          key: tools-${{ runner.os }}-${{ hashFiles('Makefile', 'go.mod') }}
+
+      # govulncheck: known vulnerabilities reachable from our code.
+      - run: make vuln
+
+  test:
+    name: Tests (make test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Uses the toolchain directive in go.mod.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      # Same Node version as frontend/Dockerfile.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.1
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # Unit + integration Go tests (testcontainers uses the runner's
+      # Docker) and frontend tests.
+      - run: make test
+
+  images:
+    name: Build image (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Mirrors the build sections of docker-compose.yml.
+        include:
+          - image: api
+            context: .
+            cmd_path: ./cmd/api
+          - image: worker
+            context: .
+            cmd_path: ./cmd/worker
+          - image: seed
+            context: .
+            cmd_path: ./cmd/seed
+          - image: mock-provider
+            context: .
+            cmd_path: ./mock-provider
+          - image: frontend
+            context: ./frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          build-args: ${{ matrix.cmd_path && format('CMD_PATH={0}', matrix.cmd_path) || '' }}
+          tags: smart-campaign-composer-${{ matrix.image }}:ci
+          push: false
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
