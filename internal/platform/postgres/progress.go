@@ -31,7 +31,7 @@ func NewProgressRepository(pool *pgxpool.Pool) *ProgressRepository {
 // window and generated_at agree. It uses
 // deliveries_campaign_status_idx. The campaign row is repeated per
 // aggregate; without deliveries, one row has NULL aggregate columns.
-const progressQuery = `SELECT c.status, c.channels, now(), g.channel, g.status, g.code, g.n, g.recent
+const progressQuery = `SELECT c.status, c.channels, c.scheduled_at, now(), g.channel, g.status, g.code, g.n, g.recent
 FROM campaigns c
 LEFT JOIN LATERAL (
 	SELECT d.channel, d.status,
@@ -50,6 +50,7 @@ func (r *ProgressRepository) Progress(ctx context.Context, id campaign.ID, windo
 		found    bool
 		status   string
 		channels []string
+		schedAt  *time.Time
 		at       time.Time
 		aggs     []monitoring.Row
 	)
@@ -63,7 +64,7 @@ func (r *ProgressRepository) Progress(ctx context.Context, id campaign.ID, windo
 			ch, st, code *string
 			n, recent    *int64
 		)
-		if err := rows.Scan(&status, &channels, &at, &ch, &st, &code, &n, &recent); err != nil {
+		if err := rows.Scan(&status, &channels, &schedAt, &at, &ch, &st, &code, &n, &recent); err != nil {
 			return monitoring.Snapshot{}, fmt.Errorf("read campaign progress: %w", err)
 		}
 		found = true
@@ -84,5 +85,9 @@ func (r *ProgressRepository) Progress(ctx context.Context, id campaign.ID, windo
 	if err != nil {
 		return monitoring.Snapshot{}, fmt.Errorf("stored channels of campaign %s: %w", id, err)
 	}
-	return monitoring.Assemble(id, campaign.Status(status), selected, aggs, window, at), nil
+	snap := monitoring.Assemble(id, campaign.Status(status), selected, aggs, window, at)
+	if schedAt != nil {
+		snap.ScheduledAt = *schedAt
+	}
+	return snap, nil
 }

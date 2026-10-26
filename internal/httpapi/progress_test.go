@@ -121,6 +121,7 @@ func TestProgress_ReturnsSnapshotJSON(t *testing.T) {
 		"failures":     []any{map[string]any{"code": "provider_rejected", "count": 2.0}},
 		"throughput":   map[string]any{"window_seconds": 10.0, "sent": 5.0, "per_second": 0.5},
 		"generated_at": "2026-10-24T09:30:00Z",
+		"scheduled_at": nil,
 	}
 	gotJSON, _ := json.Marshal(got)
 	wantJSON, _ := json.Marshal(want)
@@ -327,6 +328,32 @@ func TestEvents_CompleteEventThenClose(t *testing.T) {
 	ev := s.next()
 	if ev.name != "complete" || ev.id != "2" || !strings.Contains(ev.data, `"campaign_status":"completed"`) {
 		t.Fatalf("event = %+v, want complete with the final snapshot", ev)
+	}
+	s.ended()
+}
+
+func TestEvents_ScheduledCampaignStreamsUntilExpiry(t *testing.T) {
+	at := time.Date(2026, 10, 24, 10, 0, 0, 0, time.UTC)
+	e := newProgressEnv(t, 5)
+	e.src.set(func(s *monitoring.Snapshot) {
+		s.CampaignStatus, s.ScheduledAt = campaign.StatusScheduled, at
+		s.Channels = []monitoring.ChannelProgress{{Channel: "sms"}}
+		s.Failures = nil
+	})
+	s := openEvents(t, e, "")
+	if ev := s.next(); ev.name != "snapshot" || !strings.Contains(ev.data, `"scheduled_at":"2026-10-24T10:00:00Z"`) ||
+		!strings.Contains(ev.data, `"total":0`) {
+		t.Fatalf("event = %+v, want a snapshot with the scheduled time and no deliveries", ev)
+	}
+	// A failed release may still be canceled: the stream stays open.
+	e.src.set(func(s *monitoring.Snapshot) { s.CampaignStatus = campaign.StatusReleaseFailed })
+	if ev := s.next(); ev.name != "snapshot" || !strings.Contains(ev.data, `"campaign_status":"release_failed"`) {
+		t.Fatalf("event = %+v, want a release_failed snapshot", ev)
+	}
+	// Expired is final: nothing will be sent.
+	e.src.set(func(s *monitoring.Snapshot) { s.CampaignStatus = campaign.StatusExpired })
+	if ev := s.next(); ev.name != "complete" || !strings.Contains(ev.data, `"campaign_status":"expired"`) {
+		t.Fatalf("event = %+v, want complete for an expired campaign", ev)
 	}
 	s.ended()
 }

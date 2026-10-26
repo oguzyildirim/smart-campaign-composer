@@ -97,6 +97,8 @@ export function campaignJSON(overrides: Record<string, unknown> = {}): Record<st
     generating: false,
     approved_by: null,
     approved_at: null,
+    scheduled_at: null,
+    release_failure: null,
     created_at: '2026-10-22T12:00:00Z',
     updated_at: '2026-10-22T12:00:00Z',
     ...overrides,
@@ -195,6 +197,19 @@ export class FakeEventSource {
   }
 }
 
+// setTimeZone sets the zone of local-time conversions (Node reads TZ on
+// each use) and returns a function restoring the previous one. Specs have
+// no Node types, hence the narrow cast.
+export function setTimeZone(tz: string): () => void {
+  const env = (globalThis as unknown as { process: { env: Record<string, string | undefined> } }).process.env
+  const previous = env.TZ
+  env.TZ = tz
+  return () => {
+    if (previous === undefined) delete env.TZ
+    else env.TZ = previous
+  }
+}
+
 export function progressJSON(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     campaign_id: CAMPAIGN_ID,
@@ -208,6 +223,7 @@ export function progressJSON(overrides: Record<string, unknown> = {}): Record<st
     failures: [{ code: 'provider_rejected', count: 5 }, { code: 'consent_revoked', count: 1 }],
     throughput: { window_seconds: 10, sent: 150, per_second: 15 },
     generated_at: '2026-10-24T09:30:00Z',
+    scheduled_at: null,
     ...overrides,
   }
 }

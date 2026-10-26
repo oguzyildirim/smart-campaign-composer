@@ -36,6 +36,7 @@ type e2e struct {
 	pool     *pgxpool.Pool
 	store    *postgres.DeliveryStore
 	campaign campaign.Campaign
+	svc      *campaign.Service
 	mock     *httptest.Server
 	proc     *delivery.Processor
 	limiter  *delivery.Limiter
@@ -62,6 +63,13 @@ func newE2E(t *testing.T, faults mockprovider.Config, rate, burst int) e2e {
 // newE2EWithUsers is newE2E over a larger or smaller seed.
 func newE2EWithUsers(t *testing.T, users int, faults mockprovider.Config, rate, burst int) e2e {
 	t.Helper()
+	return buildE2E(t, users, faults, rate, burst, 0)
+}
+
+// buildE2E approves the example campaign to send now or, with a positive
+// scheduleIn, for that much later; e.svc is the campaign service.
+func buildE2E(t *testing.T, users int, faults mockprovider.Config, rate, burst int, scheduleIn time.Duration) e2e {
+	t.Helper()
 	dsn := pgtest.Start(t)
 	pgtest.Migrate(t, dsn)
 	pool, err := postgres.NewPool(t.Context(), dsn)
@@ -76,11 +84,15 @@ func newE2EWithUsers(t *testing.T, users int, faults mockprovider.Config, rate, 
 
 	audience := postgres.NewAudienceRepository(pool)
 	clock := func() time.Time { return now }
+	if scheduleIn > 0 {
+		clock = time.Now // the release happens later, in real time
+	}
 	gen := campaign.NewGenerator(mockllm.New(), segment.NewService(audience, clock), campaign.GeneratorConfig{
 		SegmentTimeout: 5 * time.Second, DraftsTimeout: 5 * time.Second, MaxAttempts: 1,
 	}, logger)
 	svc := campaign.NewService(gen, postgres.NewCampaignStore(pool), audience, campaign.ServiceConfig{
 		GenerationTimeout: 10 * time.Second, PreviewSamples: 1, DeliveryMaxAttempts: 5,
+		Schedule: campaign.ScheduleConfig{MinLead: time.Second, MaxHorizon: time.Hour, ReleaseGrace: time.Minute},
 	}, clock, logger)
 	c, err := svc.Create(t.Context(), exampleBrief)
 	if err != nil {
@@ -93,7 +105,11 @@ func newE2EWithUsers(t *testing.T, users int, faults mockprovider.Config, rate, 
 	if c, err = g.Run(t.Context(), nil); err != nil {
 		t.Fatal(err)
 	}
-	if c, err = svc.Approve(t.Context(), c.ID, campaign.Approval{Version: c.Version, ContentHash: c.ContentHash, ApprovedBy: "E2E"}); err != nil {
+	approval := campaign.Approval{Version: c.Version, ContentHash: c.ContentHash, ApprovedBy: "E2E"}
+	if scheduleIn > 0 {
+		approval.ScheduledAt = time.Now().Add(scheduleIn)
+	}
+	if c, err = svc.Approve(t.Context(), c.ID, approval); err != nil {
 		t.Fatal(err)
 	}
 
@@ -107,7 +123,7 @@ func newE2EWithUsers(t *testing.T, users int, faults mockprovider.Config, rate, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := e2e{dsn: dsn, requests: requests, pool: pool, store: postgres.NewDeliveryStore(pool), campaign: c, mock: mock, client: client,
+	e := e2e{dsn: dsn, svc: svc, requests: requests, pool: pool, store: postgres.NewDeliveryStore(pool), campaign: c, mock: mock, client: client,
 		limiter: delivery.NewLimiter(postgres.NewTokenBucket(pool, rate, burst))}
 	e.proc = e.processor(testPolicy)
 	return e
@@ -139,6 +155,74 @@ func (e e2e) rows(t *testing.T) []dbRow {
 		t.Fatal("the example campaign has no deliveries")
 	}
 	return out
+}
+
+// TestE2E_ScheduledCampaignIsReleasedAndDelivered approves the example
+// campaign for two seconds later: nothing exists until the maintenance
+// loop releases it, then every delivery is sent through the mock provider.
+func TestE2E_ScheduledCampaignIsReleasedAndDelivered(t *testing.T) {
+	e := buildE2E(t, 400, mockprovider.Config{}, 95, 5, 2*time.Second)
+	if e.campaign.Status != campaign.StatusScheduled {
+		t.Fatalf("status = %s, want scheduled", e.campaign.Status)
+	}
+	var n int
+	if err := e.pool.QueryRow(t.Context(), `SELECT count(*) FROM deliveries WHERE campaign_id = $1`, string(e.campaign.ID)).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("deliveries before release = %d (%v), want 0", n, err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- delivery.RunMaintenance(ctx, e.store, delivery.MaintenanceConfig{
+			Interval: 100 * time.Millisecond, BatchSize: 100, OutboxRetention: time.Hour, Releaser: e.svc,
+		}, logger)
+	}()
+	deadline := time.Now().Add(15 * time.Second)
+	for e.campaignStatus(t) == "scheduled" {
+		if time.Now().After(deadline) {
+			t.Fatal("the scheduled campaign was not released")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := e.campaignStatus(t); got != "approved" {
+		t.Fatalf("status after release = %s, want approved", got)
+	}
+	e.drain(t)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	rows := e.rows(t)
+	for _, r := range rows {
+		if r.status != "sent" {
+			t.Errorf("delivery %s: %s (%s), want sent", r.id, r.status, r.code)
+		}
+	}
+	var delivered, duplicates int64
+	for _, st := range e.stats(t).Channels {
+		delivered += st.Delivered
+		duplicates += st.DuplicatesSuppressed + st.DuplicateContent
+	}
+	if delivered != int64(len(rows)) || duplicates != 0 {
+		t.Errorf("provider delivered %d with %d duplicates, want %d and none", delivered, duplicates, len(rows))
+	}
+	var actions []string
+	evs, err := e.pool.Query(t.Context(), `SELECT action FROM campaign_events WHERE campaign_id = $1 ORDER BY id`, string(e.campaign.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for evs.Next() {
+		var a string
+		if err := evs.Scan(&a); err != nil {
+			t.Fatal(err)
+		}
+		actions = append(actions, a)
+	}
+	want := []string{"scheduled", "released", "sending_started", "completed"}
+	if got := actions[len(actions)-len(want):]; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("events = %v, want them to end with %v", actions, want)
+	}
 }
 
 func (e e2e) delivery(t *testing.T, id string) dbRow {

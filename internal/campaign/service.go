@@ -21,6 +21,20 @@ type ServiceConfig struct {
 	// DeliveryMaxAttempts is the attempt limit of each delivery created at
 	// approval.
 	DeliveryMaxAttempts int
+	// Schedule bounds scheduled approvals and their release.
+	Schedule ScheduleConfig
+	// ReleaseMetrics receives release outcomes; nil discards them.
+	ReleaseMetrics ReleaseMetrics
+}
+
+// ScheduleConfig bounds scheduled approvals and their release.
+type ScheduleConfig struct {
+	// MinLead and MaxHorizon bound a scheduled time relative to now.
+	MinLead    time.Duration
+	MaxHorizon time.Duration
+	// ReleaseGrace is how late a release may still happen; a campaign due
+	// for longer expires instead of sending late.
+	ReleaseGrace time.Duration
 }
 
 // ListLimit is the number of campaigns List returns.
@@ -39,6 +53,9 @@ type Service struct {
 // NewService returns a Service. audience reads outside transactions (for
 // previews); approval reads through the Store's transaction instead.
 func NewService(gen AIGenerator, store Store, audience AudienceInspector, cfg ServiceConfig, now func() time.Time, logger *slog.Logger) *Service {
+	if cfg.ReleaseMetrics == nil {
+		cfg.ReleaseMetrics = nopReleaseMetrics{}
+	}
 	return &Service{gen: gen, store: store, audience: audience, cfg: cfg, now: now, logger: logger}
 }
 

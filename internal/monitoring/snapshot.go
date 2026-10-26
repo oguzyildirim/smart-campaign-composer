@@ -90,6 +90,9 @@ type FailureCount struct {
 type Snapshot struct {
 	CampaignID     campaign.ID
 	CampaignStatus campaign.Status
+	// ScheduledAt is the campaign's release time, if it was approved for
+	// later; a scheduled campaign has no deliveries until its release.
+	ScheduledAt time.Time
 	// Channels lists the campaign's channels in a fixed order (sms, email).
 	Channels []ChannelProgress
 	// Failures lists failed deliveries by error code, most frequent first.
@@ -135,14 +138,20 @@ func (s Snapshot) PercentDone() float64 {
 	return t.PercentDone()
 }
 
-// Completed reports whether the campaign finished sending: no snapshot
-// after this one can differ.
+// Completed reports whether the campaign finished sending.
 func (s Snapshot) Completed() bool { return s.CampaignStatus == campaign.StatusCompleted }
+
+// Final reports whether no snapshot after this one can differ: the
+// campaign completed, or expired without sending. A release_failed
+// campaign is not final, since a cancel and a new approval may follow.
+func (s Snapshot) Final() bool {
+	return s.Completed() || s.CampaignStatus == campaign.StatusExpired
+}
 
 // SameState reports whether s and o describe the same progress, ignoring
 // when they were generated.
 func (s Snapshot) SameState(o Snapshot) bool {
-	return s.CampaignID == o.CampaignID && s.CampaignStatus == o.CampaignStatus && s.Window == o.Window &&
+	return s.CampaignID == o.CampaignID && s.CampaignStatus == o.CampaignStatus && s.ScheduledAt.Equal(o.ScheduledAt) && s.Window == o.Window &&
 		slices.Equal(s.Channels, o.Channels) && slices.Equal(s.Failures, o.Failures)
 }
 

@@ -40,8 +40,18 @@ const (
 	StatusAudienceReady Status = "audience_ready"
 	// StatusDraftsReady: validated drafts are stored and can be edited.
 	StatusDraftsReady Status = "drafts_ready"
+	// StatusScheduled: a human approved the exact content for a later
+	// time; immutable. No deliveries exist until the release.
+	StatusScheduled Status = "scheduled"
+	// StatusReleaseFailed: the release-time checks of a scheduled campaign
+	// failed; nothing was sent. ReleaseFailure holds the reasons.
+	StatusReleaseFailed Status = "release_failed"
+	// StatusExpired: a scheduled campaign was not released within the
+	// grace period; nothing was sent.
+	StatusExpired Status = "expired"
 	// StatusApproved: a human approved the exact content; immutable. Its
-	// deliveries were created with the approval.
+	// deliveries were created with the approval, or with the release of a
+	// scheduled campaign.
 	StatusApproved Status = "approved"
 	// StatusSending: a worker claimed the first delivery.
 	StatusSending Status = "sending"
@@ -50,13 +60,18 @@ const (
 )
 
 // transitions lists the legal status changes. drafts_ready → drafts_ready
-// is a regeneration, which replaces the drafts. The delivery workers make
-// the transitions after approved; approved → completed covers a campaign
-// with nothing left to send.
+// is a regeneration, which replaces the drafts; scheduled → scheduled is
+// a reschedule. A scheduled campaign is released (→ approved), fails its
+// release checks, or expires; until it is sent, a cancel returns it to
+// drafts_ready. The delivery workers make the transitions after approved;
+// approved → completed covers a campaign with nothing left to send.
 var transitions = map[Status][]Status{
 	StatusDraft:         {StatusAudienceReady},
 	StatusAudienceReady: {StatusDraftsReady},
-	StatusDraftsReady:   {StatusDraftsReady, StatusApproved},
+	StatusDraftsReady:   {StatusDraftsReady, StatusApproved, StatusScheduled},
+	StatusScheduled:     {StatusScheduled, StatusApproved, StatusReleaseFailed, StatusExpired, StatusDraftsReady},
+	StatusReleaseFailed: {StatusDraftsReady},
+	StatusExpired:       {StatusDraftsReady},
 	StatusApproved:      {StatusSending, StatusCompleted},
 	StatusSending:       {StatusCompleted},
 }
@@ -97,14 +112,37 @@ type Campaign struct {
 
 	ApprovedBy string
 	ApprovedAt time.Time
+	// ScheduledAt is the release time of a campaign approved for later. It
+	// is kept after the release, a release failure, or expiry, and cleared
+	// by a cancel.
+	ScheduledAt time.Time
+	// ReleaseFailure is set exactly in release_failed.
+	ReleaseFailure *ReleaseFailure
 
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
 
+// ReleaseFailure records why a scheduled campaign's release checks
+// failed: a client-safe code, message, and field errors. It never holds
+// content or recipient data.
+type ReleaseFailure struct {
+	Code    ErrorCode            `json:"code"`
+	Message string               `json:"message"`
+	Details []content.FieldError `json:"details"`
+}
+
 // HasDrafts reports whether the campaign has reviewable content.
 func (c Campaign) HasDrafts() bool {
-	return c.Status == StatusDraftsReady || c.Approved()
+	return c.Status == StatusDraftsReady || c.HoldsApproval()
+}
+
+// HoldsApproval reports whether the campaign carries a human approval
+// (approved or later, or approved for a scheduled time), so its content
+// can no longer change. A cancel removes the approval of a campaign that
+// was not sent.
+func (c Campaign) HoldsApproval() bool {
+	return c.Approved() || c.Status == StatusScheduled || c.Status == StatusReleaseFailed || c.Status == StatusExpired
 }
 
 // Approved reports whether a human approved the campaign: it is approved,
@@ -141,6 +179,12 @@ const (
 	ActionDraftsGenerated  = "drafts_generated"
 	ActionEdited           = "edited"
 	ActionApproved         = "approved"
+	ActionScheduled        = "scheduled"
+	ActionRescheduled      = "rescheduled"
+	ActionScheduleCanceled = "schedule_canceled"
+	ActionReleased         = "released"
+	ActionReleaseFailed    = "release_failed"
+	ActionExpired          = "expired"
 	ActionSendingStarted   = "sending_started"
 	ActionCompleted        = "completed"
 )

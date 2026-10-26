@@ -161,3 +161,59 @@ func TestRunMaintenance_DrainsDueRetriesEachTick(t *testing.T) {
 			m.requeued, m.recovered, m.completed, m.purged)
 	}
 }
+
+// fakeReleaser has due campaigns to release; failFirst fails its first
+// call.
+type fakeReleaser struct {
+	mu        sync.Mutex
+	due       int
+	released  int
+	failFirst bool
+	calls     int
+}
+
+func (r *fakeReleaser) ReleaseDue(_ context.Context, limit int) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	if r.failFirst && r.calls == 1 {
+		return 0, errors.New("database unavailable")
+	}
+	n := min(limit, r.due)
+	r.due -= n
+	r.released += n
+	return n, nil
+}
+
+func (r *fakeReleaser) state() (released, calls int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.released, r.calls
+}
+
+func TestRunMaintenance_ReleasesDueCampaigns(t *testing.T) {
+	m := &fakeMaintenance{}
+	r := &fakeReleaser{due: 25, failFirst: true}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- RunMaintenance(ctx, m, MaintenanceConfig{Interval: time.Millisecond, BatchSize: 10, Releaser: r}, discard)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		released, _ := r.state()
+		if released == 25 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	// The failed first call is retried on the next tick; full batches are
+	// drained within a tick.
+	if released, calls := r.state(); released != 25 || calls < 4 {
+		t.Errorf("released = %d after %d calls, want 25 after at least 4", released, calls)
+	}
+}

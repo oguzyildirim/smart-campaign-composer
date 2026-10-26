@@ -6,13 +6,24 @@ import { describeError, isAbort } from './errors'
 // connecting: before the stream opened; live: receiving updates;
 // reconnecting: the browser is re-establishing a dropped stream;
 // disconnected: the server refused the stream (retry by hand);
-// completed: the campaign finished, no stream is needed.
-export type Connection = 'connecting' | 'live' | 'reconnecting' | 'disconnected' | 'completed'
+// completed: the campaign finished, no stream is needed;
+// ended: the campaign expired without sending, no stream is needed.
+export type Connection = 'connecting' | 'live' | 'reconnecting' | 'disconnected' | 'completed' | 'ended'
+
+// finalConnection is the state for a campaign whose progress can no
+// longer change, or null while it can.
+function finalConnection(p: Progress): Connection | null {
+  if (p.campaignStatus === 'completed') return 'completed'
+  if (p.campaignStatus === 'expired') return 'ended'
+  return null
+}
 
 // useCampaignProgress loads a campaign's progress, then follows it live
 // over EventSource. Each event carries the full state and replaces the
 // shown snapshot, so reconnects and repeated events never double-count.
-// The stream is closed on completion and on unmount.
+// The stream is closed on completion or expiry and on unmount. A
+// scheduled campaign streams too, so its release shows up without a
+// reload.
 export function useCampaignProgress(id: string) {
   const progress = ref<Progress | null>(null)
   const loadState = ref<'loading' | 'ready' | 'error'>('loading')
@@ -57,9 +68,9 @@ export function useCampaignProgress(id: string) {
     })
     es.addEventListener('complete', (ev) => {
       if (source !== es) return
-      apply(ev.data)
+      const p = apply(ev.data)
       close()
-      connection.value = 'completed'
+      connection.value = (p && finalConnection(p)) ?? 'completed'
     })
   }
 
@@ -68,8 +79,9 @@ export function useCampaignProgress(id: string) {
       const p = await getProgress(id, controller.signal)
       progress.value = p
       loadState.value = 'ready'
-      if (p.campaignStatus === 'completed') {
-        connection.value = 'completed'
+      const final = finalConnection(p)
+      if (final) {
+        connection.value = final
         return
       }
       if (!controller.signal.aborted) connect()

@@ -17,9 +17,12 @@ import (
 
 // Store is an in-memory campaign.Store. Update holds a single lock while
 // fn runs, so concurrent updates are serialized as under SELECT ... FOR
-// UPDATE. Audience is the inspector passed to UpdateFunc.
+// UPDATE. Audience is the inspector passed to UpdateFunc; Now is the
+// clock DueScheduled compares with (time.Now when nil), standing in for
+// the database clock.
 type Store struct {
 	Audience campaign.AudienceInspector
+	Now      func() time.Time
 
 	mu        sync.Mutex
 	campaigns map[campaign.ID]campaign.Campaign
@@ -106,6 +109,29 @@ func (s *Store) Update(ctx context.Context, id campaign.ID, fn campaign.UpdateFu
 	return clone(next), nil
 }
 
+// DueScheduled implements campaign.Store.
+func (s *Store) DueScheduled(_ context.Context, limit int) ([]campaign.ID, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	if s.Now != nil {
+		now = s.Now()
+	}
+	var due []campaign.Campaign
+	for _, id := range s.order {
+		c := s.campaigns[id]
+		if c.Status == campaign.StatusScheduled && !c.ScheduledAt.After(now) {
+			due = append(due, c)
+		}
+	}
+	slices.SortStableFunc(due, func(a, b campaign.Campaign) int { return a.ScheduledAt.Compare(b.ScheduledAt) })
+	out := make([]campaign.ID, 0, min(limit, len(due)))
+	for _, c := range due[:min(limit, len(due))] {
+		out = append(out, c.ID)
+	}
+	return out, nil
+}
+
 // Plans returns the delivery plans written for id, in order.
 func (s *Store) Plans(id campaign.ID) []campaign.DeliveryPlan {
 	s.mu.Lock()
@@ -131,6 +157,11 @@ func clone(c campaign.Campaign) campaign.Campaign {
 	c.Channels = slices.Clone(c.Channels)
 	c.UnsupportedCriteria = slices.Clone(c.UnsupportedCriteria)
 	c.Rule.Conditions = slices.Clone(c.Rule.Conditions)
+	if c.ReleaseFailure != nil {
+		f := *c.ReleaseFailure
+		f.Details = slices.Clone(f.Details)
+		c.ReleaseFailure = &f
+	}
 	return c
 }
 

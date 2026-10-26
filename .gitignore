@@ -25,5 +25,4 @@ frontend/dist/
 .DS_Store
 
 project.md
-prompts.md
-DECISIONS.md
+ai-sessions/DECISIONS.md

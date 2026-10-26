@@ -62,7 +62,8 @@ not `./...`: `frontend/node_modules` contains stray `.go` files.
 - `internal/segment` — domain: segment rule DSL (strict parse/validate,
   compile to parameterized SQL), preview service, `AudienceCounter` port.
 - `internal/campaign` — domain: campaign state machine, edits, generation
-  lease, preview, approval (`Service`, `Store`/`AudienceInspector` ports,
+  lease, preview, approval, scheduled approval with reschedule/cancel and
+  release by the worker (`Service`, `Store`/`AudienceInspector` ports,
   content hash); AI generation (`Generator`: brief validation, strict
   LLM-output decoding, bounded repair retry, error codes); incremental
   draft-field extraction for streaming. `internal/campaign/campaigntest` —
@@ -71,8 +72,9 @@ not `./...`: `frontend/node_modules` contains stray `.go` files.
   plain-text checks, per-recipient rendering with final validation.
 - `internal/delivery` — domain: delivery processing (claim, rate limit,
   consent/render, send, record), retry policy, shared-bucket limiter,
-  outbox relay and maintenance loops; `Store`/`Provider`/`RateLimiter`/
-  `Outbox`/`Publisher` ports.
+  outbox relay and maintenance loops (incl. releasing due scheduled
+  campaigns); `Store`/`Provider`/`RateLimiter`/`Outbox`/`Publisher`/
+  `Releaser` ports.
 - `internal/monitoring` — domain: campaign progress read model (snapshot,
   `Source` port, `Hub` with one shared poller per campaign).
 - `internal/mockprovider` — the mock provider's HTTP API: idempotency,
@@ -103,6 +105,8 @@ not `./...`: `frontend/node_modules` contains stray `.go` files.
   (Vitest, ESLint); `src/api` holds the typed API client, response guards,
   and SSE reader; `src/composables` shared state (draft stream, campaign
   progress over EventSource); `src/views` the pages.
+- `docs/` — detailed reference as an Open Knowledge Format bundle
+  (markdown with YAML frontmatter, `index.md` per folder, `log.md`).
 - `ai-sessions/` — Claude session exports, written automatically by the
   `SessionEnd` hook; never hand-edited or mixed into source commits.
 

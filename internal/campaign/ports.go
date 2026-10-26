@@ -22,6 +22,10 @@ type Store interface {
 	// nothing. fn's error aborts the transaction and is returned as is.
 	// Update returns the campaign as stored afterwards, or ErrNotFound.
 	Update(ctx context.Context, id ID, fn UpdateFunc) (Campaign, error)
+	// DueScheduled returns up to limit scheduled campaigns whose scheduled
+	// time has passed by the store's clock, oldest due first, skipping
+	// campaigns another transaction holds.
+	DueScheduled(ctx context.Context, limit int) ([]ID, error)
 }
 
 // UpdateFunc decides a change to a locked campaign. audience reads the

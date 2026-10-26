@@ -56,6 +56,14 @@ const (
 	minProgressPollInterval         = 100 * time.Millisecond
 	DefaultOutboxBatchSize          = 500
 	DefaultDeliveryScanInterval     = time.Second
+	// Scheduled delivery: a due campaign that is not released within the
+	// grace period expires instead of sending late.
+	DefaultScheduleReleaseGrace = 15 * time.Minute
+	DefaultScheduleMinLead      = time.Minute
+	DefaultScheduleMaxHorizon   = 30 * 24 * time.Hour
+	maxScheduleReleaseGrace     = 24 * time.Hour
+	maxScheduleMinLead          = 24 * time.Hour
+	maxScheduleMaxHorizon       = 366 * 24 * time.Hour
 	// MaxSendsPerSecond is the product limit per channel. Rate plus burst
 	// may not exceed it: a token bucket admits at most rate + burst sends
 	// in any one-second window.
@@ -115,10 +123,21 @@ type Config struct {
 	Worker   WorkerConfig
 	LLM      LLMConfig
 	Delivery DeliveryConfig
+	Schedule ScheduleConfig
 }
 
-// DeliveryConfig configures message delivery. MaxAttempts is used by the
-// API (stored on each delivery at approval); the rest by the worker.
+// ScheduleConfig configures scheduled delivery. MinLead and MaxHorizon
+// bound scheduled times (API); ReleaseGrace bounds how late the worker
+// may still release a due campaign.
+type ScheduleConfig struct {
+	ReleaseGrace time.Duration
+	MinLead      time.Duration
+	MaxHorizon   time.Duration
+}
+
+// DeliveryConfig configures message delivery. MaxAttempts is stored on
+// each delivery when it is created, by the API at approval or by the
+// worker at a scheduled release; the rest is used by the worker.
 type DeliveryConfig struct {
 	MaxAttempts     int
 	ProviderURL     string
@@ -272,6 +291,17 @@ func Load(getenv Getenv) (Config, error) {
 	}
 	if d.Lease < 2*d.ProviderTimeout {
 		p.fail("DELIVERY_LEASE", "must be at least twice PROVIDER_TIMEOUT (%s)", d.ProviderTimeout)
+	}
+	cfg.Schedule = ScheduleConfig{
+		ReleaseGrace: p.duration("SCHEDULE_RELEASE_GRACE", DefaultScheduleReleaseGrace, maxScheduleReleaseGrace),
+		MinLead:      p.duration("SCHEDULE_MIN_LEAD", DefaultScheduleMinLead, maxScheduleMinLead),
+		MaxHorizon:   p.duration("SCHEDULE_MAX_HORIZON", DefaultScheduleMaxHorizon, maxScheduleMaxHorizon),
+	}
+	if sc := cfg.Schedule; sc.ReleaseGrace <= d.MaintenanceInterval {
+		p.fail("SCHEDULE_RELEASE_GRACE", "must be longer than DELIVERY_SCAN_INTERVAL (%s)", d.MaintenanceInterval)
+	}
+	if sc := cfg.Schedule; sc.MinLead >= sc.MaxHorizon {
+		p.fail("SCHEDULE_MIN_LEAD", "must be shorter than SCHEDULE_MAX_HORIZON (%s)", sc.MaxHorizon)
 	}
 	cfg.LLM = LLMConfig{
 		Provider:        p.llmProvider("LLM_PROVIDER", cfg.AnthropicAPIKey.IsSet()),

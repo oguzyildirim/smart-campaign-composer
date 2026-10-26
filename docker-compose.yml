@@ -18,8 +18,15 @@ x-app-env: &app-env
   DATABASE_URL: postgres://${POSTGRES_USER:?copy .env.example to .env}:${POSTGRES_PASSWORD:?copy .env.example to .env}@postgres:5432/${POSTGRES_DB:?copy .env.example to .env}?sslmode=disable
   KAFKA_BROKERS: kafka:9092
   SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-10s}
-  # Stored on each delivery at approval (api) and enforced by workers.
+  # Stored on each delivery at approval (api) or release (worker) and
+  # enforced by workers.
   DELIVERY_MAX_ATTEMPTS: ${DELIVERY_MAX_ATTEMPTS:-5}
+  # Scheduled delivery: the api checks scheduled times against the lead
+  # and horizon; workers release due campaigns or expire them after the
+  # grace period.
+  SCHEDULE_RELEASE_GRACE: ${SCHEDULE_RELEASE_GRACE:-15m}
+  SCHEDULE_MIN_LEAD: ${SCHEDULE_MIN_LEAD:-1m}
+  SCHEDULE_MAX_HORIZON: ${SCHEDULE_MAX_HORIZON:-720h}
 
 services:
   postgres:

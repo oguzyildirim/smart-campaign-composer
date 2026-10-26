@@ -1,7 +1,8 @@
 // Command worker delivers approved campaign messages: it relays the
 // outbox to Kafka, consumes delivery jobs, sends them through the mock
 // provider under the shared rate limit, and runs retry scheduling, lease
-// recovery, and campaign completion.
+// recovery, and campaign completion. It also releases scheduled campaigns
+// when they are due, which creates their deliveries.
 //
 // Usage:
 //
@@ -20,6 +21,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/oguzyildirim/smart-campaign-composer/internal/campaign"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/config"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/content"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/delivery"
@@ -70,7 +72,7 @@ func run(ctx context.Context) error {
 	logger := logging.New(os.Stdout, service, cfg.LogLevel)
 	logger.Info("starting", "health_addr", cfg.Worker.HealthAddr, "kafka_brokers", cfg.KafkaBrokers,
 		"provider_url", d.ProviderURL, "rate_limit_per_second", d.RateLimitPerSecond, "rate_limit_burst", d.RateLimitBurst,
-		"concurrency", d.Concurrency)
+		"concurrency", d.Concurrency, "schedule_release_grace", cfg.Schedule.ReleaseGrace.String())
 
 	pool, err := postgres.NewPool(ctx, cfg.DatabaseURL.Reveal())
 	if err != nil {
@@ -86,6 +88,17 @@ func run(ctx context.Context) error {
 
 	registry := metrics.NewRegistry()
 	deliveryMetrics := metrics.NewDelivery(registry)
+
+	// Releases need the campaign service's approval checks but no LLM:
+	// Release never generates content, so the generator is nil.
+	campaigns := campaign.NewService(nil, postgres.NewCampaignStore(pool), postgres.NewAudienceRepository(pool),
+		campaign.ServiceConfig{
+			DeliveryMaxAttempts: d.MaxAttempts,
+			Schedule: campaign.ScheduleConfig{
+				MinLead: cfg.Schedule.MinLead, MaxHorizon: cfg.Schedule.MaxHorizon, ReleaseGrace: cfg.Schedule.ReleaseGrace,
+			},
+			ReleaseMetrics: metrics.NewRelease(registry),
+		}, time.Now, logger)
 
 	topics := []string{delivery.Topic(content.ChannelSMS), delivery.Topic(content.ChannelEmail)}
 	store := postgres.NewDeliveryStore(pool)
@@ -139,7 +152,7 @@ func run(ctx context.Context) error {
 			{Name: "delivery maintenance", Run: func(ctx context.Context) error {
 				return delivery.RunMaintenance(ctx, store, delivery.MaintenanceConfig{
 					Interval: d.MaintenanceInterval, BatchSize: d.OutboxBatchSize, OutboxRetention: outboxRetention,
-					Metrics: deliveryMetrics,
+					Metrics: deliveryMetrics, Releaser: campaigns,
 				}, logger)
 			}},
 		},

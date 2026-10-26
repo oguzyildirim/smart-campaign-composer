@@ -123,6 +123,14 @@ type Maintenance interface {
 	PendingOutbox(ctx context.Context) (int, error)
 }
 
+// Releaser releases scheduled campaigns that are due, creating their
+// deliveries. *campaign.Service implements it.
+type Releaser interface {
+	// ReleaseDue handles up to limit due campaigns and returns how many
+	// changed.
+	ReleaseDue(ctx context.Context, limit int) (int, error)
+}
+
 // MaintenanceConfig paces RunMaintenance.
 type MaintenanceConfig struct {
 	Interval  time.Duration
@@ -133,13 +141,17 @@ type MaintenanceConfig struct {
 	// Metrics receives recovered leases and the outbox backlog; nil
 	// discards them.
 	Metrics Metrics
+	// Releaser, when set, releases due scheduled campaigns first on every
+	// tick, so a release is at most one Interval late while workers run.
+	Releaser Releaser
 }
 
 // purgeEvery runs the outbox purge on every n-th maintenance tick.
 const purgeEvery = 60
 
-// RunMaintenance runs lease recovery, the retry scheduler, and campaign
-// completion every interval until ctx ends. Completion here is a safety
+// RunMaintenance runs the release of due scheduled campaigns, lease
+// recovery, the retry scheduler, and campaign completion every interval
+// until ctx ends. Completion here is a safety
 // net: workers also complete a campaign when they finish its last
 // delivery.
 func RunMaintenance(ctx context.Context, m Maintenance, cfg MaintenanceConfig, logger *slog.Logger) error {
@@ -155,21 +167,16 @@ func RunMaintenance(ctx context.Context, m Maintenance, cfg MaintenanceConfig, l
 }
 
 func maintain(ctx context.Context, m Maintenance, cfg MaintenanceConfig, purge bool, logger *slog.Logger) {
+	if cfg.Releaser != nil {
+		drain(ctx, cfg.BatchSize, cfg.Releaser.ReleaseDue, logger, "release scheduled campaigns")
+	}
 	if n, err := m.RecoverExpiredLeases(ctx, cfg.BatchSize); err != nil {
 		logMaintenanceError(ctx, logger, "recover expired leases", err)
 	} else if n > 0 {
 		cfg.Metrics.LeasesRecovered(n)
 		logger.InfoContext(ctx, "recovered deliveries with expired leases", "deliveries", n)
 	}
-	for {
-		n, err := m.RequeueDue(ctx, cfg.BatchSize)
-		if err != nil {
-			logMaintenanceError(ctx, logger, "requeue due retries", err)
-		}
-		if err != nil || n < cfg.BatchSize {
-			break
-		}
-	}
+	drain(ctx, cfg.BatchSize, m.RequeueDue, logger, "requeue due retries")
 	if n, err := m.CompleteFinishedCampaigns(ctx); err != nil {
 		logMaintenanceError(ctx, logger, "complete finished campaigns", err)
 	} else if n > 0 {
@@ -183,6 +190,20 @@ func maintain(ctx context.Context, m Maintenance, cfg MaintenanceConfig, purge b
 	if purge {
 		if _, err := m.PurgePublishedOutbox(ctx, cfg.OutboxRetention); err != nil {
 			logMaintenanceError(ctx, logger, "purge published outbox", err)
+		}
+	}
+}
+
+// drain calls step with batch until it handles less than a full batch or
+// fails.
+func drain(ctx context.Context, batch int, step func(context.Context, int) (int, error), logger *slog.Logger, task string) {
+	for {
+		n, err := step(ctx, batch)
+		if err != nil {
+			logMaintenanceError(ctx, logger, task, err)
+		}
+		if err != nil || n < batch {
+			return
 		}
 	}
 }

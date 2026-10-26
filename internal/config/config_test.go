@@ -430,3 +430,48 @@ func TestLoad_Progress(t *testing.T) {
 		})
 	}
 }
+
+func TestLoad_Schedule(t *testing.T) {
+	cfg, err := Load(envFrom(validEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := cfg.Schedule; s.ReleaseGrace != 15*time.Minute || s.MinLead != time.Minute || s.MaxHorizon != 720*time.Hour {
+		t.Errorf("schedule defaults = %+v, want 15m grace, 1m lead, 720h horizon", s)
+	}
+
+	vars := validEnv()
+	vars["SCHEDULE_RELEASE_GRACE"], vars["SCHEDULE_MIN_LEAD"], vars["SCHEDULE_MAX_HORIZON"] = "2m", "30s", "48h"
+	cfg, err = Load(envFrom(vars))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := cfg.Schedule; s.ReleaseGrace != 2*time.Minute || s.MinLead != 30*time.Second || s.MaxHorizon != 48*time.Hour {
+		t.Errorf("schedule overrides = %+v", s)
+	}
+
+	for _, tt := range []struct {
+		vars map[string]string
+		key  string
+	}{
+		{map[string]string{"SCHEDULE_RELEASE_GRACE": "0s"}, "SCHEDULE_RELEASE_GRACE"},
+		{map[string]string{"SCHEDULE_RELEASE_GRACE": "25h"}, "SCHEDULE_RELEASE_GRACE"},
+		{map[string]string{"SCHEDULE_RELEASE_GRACE": "later"}, "SCHEDULE_RELEASE_GRACE"},
+		{map[string]string{"SCHEDULE_MIN_LEAD": "-1m"}, "SCHEDULE_MIN_LEAD"},
+		{map[string]string{"SCHEDULE_MAX_HORIZON": "0s"}, "SCHEDULE_MAX_HORIZON"},
+		{map[string]string{"SCHEDULE_MAX_HORIZON": "9000h"}, "SCHEDULE_MAX_HORIZON"},
+		// The release loop runs every DELIVERY_SCAN_INTERVAL; a grace no
+		// longer than that could expire campaigns before the loop saw them.
+		{map[string]string{"SCHEDULE_RELEASE_GRACE": "1s"}, "SCHEDULE_RELEASE_GRACE"},
+		{map[string]string{"SCHEDULE_RELEASE_GRACE": "30s", "DELIVERY_SCAN_INTERVAL": "30s"}, "SCHEDULE_RELEASE_GRACE"},
+		{map[string]string{"SCHEDULE_MIN_LEAD": "2h", "SCHEDULE_MAX_HORIZON": "2h"}, "SCHEDULE_MIN_LEAD"},
+	} {
+		t.Run(fmt.Sprint(tt.vars), func(t *testing.T) {
+			vars := validEnv()
+			maps.Copy(vars, tt.vars)
+			if _, err := Load(envFrom(vars)); err == nil || !strings.Contains(err.Error(), tt.key) {
+				t.Errorf("Load() error = %v, want one mentioning %s", err, tt.key)
+			}
+		})
+	}
+}

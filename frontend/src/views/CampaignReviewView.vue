@@ -3,10 +3,14 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { RouterLink, useRouter } from 'vue-router'
 import {
   approveCampaign,
+  cancelCampaign,
   editCampaign,
   getCampaign,
+  holdsApproval,
   isApproved,
+  isScheduleStatus,
   previewCampaign,
+  rescheduleCampaign,
   type Campaign,
   type Channel,
   type Drafts,
@@ -16,7 +20,9 @@ import ApproveDialog from '../components/ApproveDialog.vue'
 import AudiencePanel from '../components/AudiencePanel.vue'
 import DraftEditor from '../components/DraftEditor.vue'
 import PreviewPanel from '../components/PreviewPanel.vue'
+import SchedulePanel from '../components/SchedulePanel.vue'
 import StatusBadge from '../components/StatusBadge.vue'
+import { formatWithOffset } from '../api/time'
 import { describeError, isAbort } from '../composables/errors'
 import { useDraftStream } from '../composables/useDraftStream'
 
@@ -46,6 +52,9 @@ const dialogOpen = ref(false)
 const approving = ref(false)
 const approveError = ref('')
 
+const scheduleBusy = ref(false)
+const scheduleError = ref('')
+
 const router = useRouter()
 const stream = useDraftStream()
 const controller = new AbortController()
@@ -55,7 +64,9 @@ let saveTimer: ReturnType<typeof setTimeout> | undefined
 let saveQueued = false
 let previewSeq = 0
 
-const readonly = computed(() => campaign.value !== null && isApproved(campaign.value.status))
+const readonly = computed(() => campaign.value !== null && holdsApproval(campaign.value.status))
+const sent = computed(() => campaign.value !== null && isApproved(campaign.value.status))
+const awaitingRelease = computed(() => campaign.value !== null && isScheduleStatus(campaign.value.status))
 const editable = computed(() => campaign.value?.status === 'drafts_ready' && !stream.streaming.value)
 const previewCurrent = computed(
   () => preview.value !== null && campaign.value !== null && preview.value.version === campaign.value.version,
@@ -169,21 +180,23 @@ function openApprove() {
   dialogOpen.value = true
 }
 
-async function approve(approvedBy: string) {
+async function approve(approvedBy: string, scheduledAt: string | undefined) {
   const c = campaign.value
   if (!c || approving.value) return
   approving.value = true
   approveError.value = ''
   try {
+    const input = { version: c.version, content_hash: c.contentHash, approved_by: approvedBy }
     const approved = await approveCampaign(
       props.id,
-      { version: c.version, content_hash: c.contentHash, approved_by: approvedBy },
+      scheduledAt ? { ...input, scheduled_at: scheduledAt } : input,
       controller.signal,
     )
     campaign.value = approved
     syncForm(approved)
     dialogOpen.value = false
-    // Watch the delivery the approval just queued.
+    // Watch the delivery the approval just queued, or the countdown to
+    // its release.
     void router.push(`/campaigns/${props.id}/dashboard`)
   } catch (err) {
     if (isAbort(err)) return
@@ -191,6 +204,42 @@ async function approve(approvedBy: string) {
   } finally {
     approving.value = false
   }
+}
+
+// changeSchedule runs a reschedule or cancel and shows the backend's
+// answer; a campaign released in the meantime makes it fail (409).
+async function changeSchedule(run: (c: Campaign) => Promise<Campaign>) {
+  const c = campaign.value
+  if (!c || scheduleBusy.value) return
+  scheduleBusy.value = true
+  scheduleError.value = ''
+  try {
+    const updated = await run(c)
+    campaign.value = updated
+    syncForm(updated)
+    if (updated.drafts) void loadPreview()
+  } catch (err) {
+    if (isAbort(err)) return
+    scheduleError.value = describeError(err)
+  } finally {
+    scheduleBusy.value = false
+  }
+}
+
+function reschedule(actor: string, scheduledAt: string) {
+  void changeSchedule((c) =>
+    rescheduleCampaign(
+      props.id,
+      { version: c.version, content_hash: c.contentHash, scheduled_at: scheduledAt, actor },
+      controller.signal,
+    ),
+  )
+}
+
+function cancelSchedule(actor: string) {
+  void changeSchedule((c) =>
+    cancelCampaign(props.id, { version: c.version, content_hash: c.contentHash, actor }, controller.signal),
+  )
 }
 
 onMounted(load)
@@ -233,14 +282,24 @@ function formatDate(iso: string | null): string {
       <strong>Brief:</strong> {{ campaign.brief }}
     </p>
 
+    <SchedulePanel
+      v-if="awaitingRelease"
+      :campaign="campaign"
+      :pending="scheduleBusy"
+      :error="scheduleError"
+      @reschedule="reschedule"
+      @cancel="cancelSchedule"
+    />
+
     <div
-      v-if="readonly"
+      v-if="sent"
       class="ok"
       role="status"
       data-testid="approved-banner"
     >
-      Approved by {{ campaign.approvedBy }} on {{ formatDate(campaign.approvedAt) }}. This campaign can no longer be
-      edited.
+      Approved by {{ campaign.approvedBy }} on {{ formatDate(campaign.approvedAt) }}<template v-if="campaign.scheduledAt">
+        to send at {{ formatWithOffset(campaign.scheduledAt) }}
+      </template>. This campaign can no longer be edited.
       <RouterLink
         :to="`/campaigns/${id}/dashboard`"
         data-testid="dashboard-link"
@@ -249,7 +308,10 @@ function formatDate(iso: string | null): string {
       </RouterLink>
     </div>
 
-    <AudiencePanel :audience="campaign.audience" />
+    <AudiencePanel
+      :audience="campaign.audience"
+      :estimate="awaitingRelease"
+    />
 
     <section
       v-if="campaign.status === 'audience_ready' || stream.streaming.value"

@@ -1,10 +1,13 @@
 <script setup lang="ts">
-import { nextTick, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { MAX_APPROVER_CHARS, type Channel, type Counts } from '../api/campaigns'
+import { localInputToRFC3339 } from '../api/time'
 
-// ApproveDialog asks for explicit confirmation and the operator's name.
-// Confirm is disabled while a request is pending, so repeated clicks send
-// one request; the parent also guards against re-entry.
+// ApproveDialog asks for explicit confirmation, the operator's name, and
+// whether to send now or at a scheduled local time (sent to the backend
+// with its UTC offset; the backend checks it). Confirm is disabled while
+// a request is pending, so repeated clicks send one request; the parent
+// also guards against re-entry.
 const props = defineProps<{
   open: boolean
   pending: boolean
@@ -13,10 +16,16 @@ const props = defineProps<{
   counts: Counts
 }>()
 
-const emit = defineEmits<{ confirm: [approvedBy: string]; cancel: [] }>()
+// confirm's scheduledAt is RFC 3339 with offset, or undefined to send now.
+const emit = defineEmits<{ confirm: [approvedBy: string, scheduledAt: string | undefined]; cancel: [] }>()
 
 const name = ref('')
+const when = ref<'now' | 'schedule'>('now')
+const localTime = ref('')
 const input = ref<HTMLInputElement | null>(null)
+
+const scheduledAt = computed(() => (when.value === 'schedule' ? localInputToRFC3339(localTime.value) : null))
+const ready = computed(() => name.value.trim() !== '' && (when.value === 'now' || scheduledAt.value !== null))
 
 watch(
   () => props.open,
@@ -29,9 +38,8 @@ watch(
 )
 
 function confirm() {
-  const trimmed = name.value.trim()
-  if (props.pending || trimmed === '') return
-  emit('confirm', trimmed)
+  if (props.pending || !ready.value) return
+  emit('confirm', name.value.trim(), when.value === 'schedule' ? (scheduledAt.value ?? undefined) : undefined)
 }
 </script>
 
@@ -53,7 +61,10 @@ function confirm() {
       <p>
         You approve exactly the content and audience shown on this page for
         <strong>{{ channels.map((c) => (c === 'sms' ? `SMS (${counts.sms})` : `email (${counts.email})`)).join(' and ') }}</strong>
-        recipients. Approved campaigns can no longer be edited.
+        recipients<template v-if="when === 'schedule'">
+          (an estimate: the audience is built again at the scheduled time)
+        </template>. Approved campaigns can no longer be
+        edited.
       </p>
       <form @submit.prevent="confirm">
         <label for="approver-name">Your name</label>
@@ -66,6 +77,36 @@ function confirm() {
           :maxlength="MAX_APPROVER_CHARS"
           required
         >
+        <fieldset class="when">
+          <legend>When</legend>
+          <label>
+            <input
+              v-model="when"
+              type="radio"
+              value="now"
+              data-testid="when-now"
+            >
+            Send now
+          </label>
+          <label>
+            <input
+              v-model="when"
+              type="radio"
+              value="schedule"
+              data-testid="when-schedule"
+            >
+            Schedule
+          </label>
+        </fieldset>
+        <template v-if="when === 'schedule'">
+          <label for="scheduled-at">Send at (your local time)</label>
+          <input
+            id="scheduled-at"
+            v-model="localTime"
+            type="datetime-local"
+            required
+          >
+        </template>
         <p
           v-if="error"
           class="error"
@@ -85,9 +126,9 @@ function confirm() {
           <button
             type="submit"
             data-testid="confirm-approve"
-            :disabled="pending || name.trim() === ''"
+            :disabled="pending || !ready"
           >
-            {{ pending ? 'Approving…' : 'Approve' }}
+            {{ pending ? 'Approving…' : when === 'schedule' ? 'Schedule' : 'Approve' }}
           </button>
         </div>
       </form>
@@ -111,18 +152,31 @@ function confirm() {
   max-width: 480px;
   width: 100%;
 }
-.dialog label {
+.dialog > form > label {
   display: block;
   font-weight: 600;
-  margin-bottom: 0.25rem;
+  margin: 0.5rem 0 0.25rem;
 }
-.dialog input {
+.dialog input[type='text'],
+.dialog input[type='datetime-local'] {
   width: 100%;
   box-sizing: border-box;
   font: inherit;
   padding: 0.45rem;
   border: 1px solid #cbd5e1;
   border-radius: 6px;
+}
+.when {
+  border: none;
+  padding: 0;
+  margin: 0.75rem 0 0;
+  display: flex;
+  gap: 1rem;
+}
+.when legend {
+  font-weight: 600;
+  padding: 0;
+  margin-bottom: 0.25rem;
 }
 .actions {
   display: flex;

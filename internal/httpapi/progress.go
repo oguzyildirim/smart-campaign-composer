@@ -63,14 +63,17 @@ type progressHandler struct {
 // GET /progress and the data of every progress stream event. It is the
 // full state, so clients replace what they show with each one.
 type ProgressResponse struct {
-	CampaignID     string            `json:"campaign_id"`
-	CampaignStatus campaign.Status   `json:"campaign_status"`
-	Channels       []ChannelCounts   `json:"channels"`
-	Totals         StatusCounts      `json:"totals"`
-	PercentDone    float64           `json:"percent_done"`
-	Failures       []FailureResponse `json:"failures"`
-	Throughput     Throughput        `json:"throughput"`
-	GeneratedAt    time.Time         `json:"generated_at"`
+	CampaignID     string          `json:"campaign_id"`
+	CampaignStatus campaign.Status `json:"campaign_status"`
+	// ScheduledAt is the release time of a campaign approved for later;
+	// until then it has no deliveries.
+	ScheduledAt *time.Time        `json:"scheduled_at"`
+	Channels    []ChannelCounts   `json:"channels"`
+	Totals      StatusCounts      `json:"totals"`
+	PercentDone float64           `json:"percent_done"`
+	Failures    []FailureResponse `json:"failures"`
+	Throughput  Throughput        `json:"throughput"`
+	GeneratedAt time.Time         `json:"generated_at"`
 }
 
 // StatusCounts counts deliveries by status.
@@ -114,6 +117,7 @@ func progressResponse(s monitoring.Snapshot) ProgressResponse {
 	out := ProgressResponse{
 		CampaignID:     string(s.CampaignID),
 		CampaignStatus: s.CampaignStatus,
+		ScheduledAt:    optionalTime(s.ScheduledAt),
 		Channels:       make([]ChannelCounts, len(s.Channels)),
 		Totals:         statusCounts(s.Totals()),
 		PercentDone:    s.PercentDone(),
@@ -148,7 +152,7 @@ func (h progressHandler) progress(w http.ResponseWriter, r *http.Request) {
 // events streams a campaign's progress as Server-Sent Events for
 // EventSource. It sends the current snapshot on connect and afterwards
 // each snapshot that differs from the last one sent; when the campaign is
-// completed it sends a final complete event and closes. Event ids
+// completed or expired it sends a final complete event and closes. Event ids
 // continue from Last-Event-ID, so they keep increasing across reconnects;
 // a reconnect always starts with a fresh full snapshot.
 func (h progressHandler) events(w http.ResponseWriter, r *http.Request) {
@@ -184,13 +188,13 @@ func (h progressHandler) events(w http.ResponseWriter, r *http.Request) {
 	send := func(s monitoring.Snapshot) (done bool) {
 		seq++
 		name := eventSnapshot
-		if s.Completed() {
+		if s.Final() {
 			name = eventComplete
 		}
 		if err := stream.eventWithID(seq, name, progressResponse(s)); err != nil {
 			return true // the client is gone
 		}
-		return s.Completed()
+		return s.Final()
 	}
 	if send(last) {
 		return

@@ -4,7 +4,7 @@
 
 import { ApiError, API_BASE, requestJSON } from './client'
 import { CHANNELS, STATUSES, type CampaignStatus, type Channel } from './campaigns'
-import { asArray, asNumber, asObject, asOneOf, asString, ShapeError } from './guards'
+import { asArray, asNumber, asObject, asOneOf, asString, nullable, ShapeError } from './guards'
 
 export const DELIVERY_STATUSES = ['queued', 'processing', 'sent', 'failed', 'retrying'] as const
 export type DeliveryStatus = (typeof DELIVERY_STATUSES)[number]
@@ -26,6 +26,8 @@ export interface FailureCount {
 export interface Progress {
   campaignId: string
   campaignStatus: CampaignStatus
+  // scheduledAt is the release time of a campaign approved for later.
+  scheduledAt: string | null
   channels: ChannelProgress[]
   totals: StatusCounts
   percentDone: number
@@ -53,6 +55,7 @@ export function parseProgress(v: unknown): Progress {
   return {
     campaignId: asString(o.campaign_id, 'campaign_id'),
     campaignStatus: asOneOf(o.campaign_status, STATUSES, 'campaign_status'),
+    scheduledAt: nullable(o.scheduled_at, (v) => asString(v, 'scheduled_at')),
     channels: asArray(o.channels, 'channels').map((c, i) => {
       const p = `channels[${i}]`
       const co = asObject(c, p)
@@ -91,7 +94,8 @@ export async function getProgress(id: string, signal?: AbortSignal): Promise<Pro
 }
 
 // progressEventsURL is the live stream for EventSource. Events: "snapshot"
-// and a final "complete", both carrying a full Progress.
+// and a final "complete" (completed or expired), both carrying a full
+// Progress.
 export function progressEventsURL(id: string): string {
   return `${API_BASE}${base}/${encodeURIComponent(id)}/events`
 }

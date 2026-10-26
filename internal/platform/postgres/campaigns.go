@@ -36,7 +36,7 @@ func NewCampaignStore(pool *pgxpool.Pool) *CampaignStore {
 const campaignColumns = `id::text, brief, status, segment_rule, segment_explanation, unsupported_criteria,
 	audience_total, audience_sms, audience_email, channels, sms_body, email_subject, email_body,
 	version, content_hash, generation_token, generation_expires_at, approved_by, approved_at,
-	created_at, updated_at`
+	scheduled_at, release_failure, created_at, updated_at`
 
 // Create implements campaign.Store.
 func (s *CampaignStore) Create(ctx context.Context, c campaign.Campaign, events []campaign.Event) (campaign.Campaign, error) {
@@ -127,18 +127,53 @@ func (s *CampaignStore) Update(ctx context.Context, id campaign.ID, fn campaign.
 	return result, nil
 }
 
+// dueQuery selects scheduled campaigns due by the database clock, so
+// worker clock skew never moves a release. SKIP LOCKED passes over
+// campaigns another transaction is releasing or canceling; the lock ends
+// with the statement, and Release re-checks under its own lock.
+const dueQuery = `SELECT id::text FROM campaigns
+WHERE status = 'scheduled' AND scheduled_at <= clock_timestamp()
+ORDER BY scheduled_at, id
+LIMIT $1
+FOR UPDATE SKIP LOCKED`
+
+// DueScheduled implements campaign.Store.
+func (s *CampaignStore) DueScheduled(ctx context.Context, limit int) ([]campaign.ID, error) {
+	rows, err := s.pool.Query(ctx, dueQuery, limit)
+	if err != nil {
+		return nil, fmt.Errorf("find due campaigns: %w", err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("find due campaigns: %w", err)
+	}
+	out := make([]campaign.ID, len(ids))
+	for i, id := range ids {
+		out[i] = campaign.ID(id)
+	}
+	return out, nil
+}
+
 // writeCampaign persists the mutable columns. The audience proposal and
 // brief are fixed at creation and never rewritten.
 func writeCampaign(ctx context.Context, tx pgx.Tx, lockedVersion int, c campaign.Campaign) (campaign.Campaign, error) {
+	var failure []byte
+	if c.ReleaseFailure != nil {
+		var err error
+		if failure, err = json.Marshal(c.ReleaseFailure); err != nil {
+			return campaign.Campaign{}, fmt.Errorf("encode release failure: %w", err)
+		}
+	}
 	row := tx.QueryRow(ctx, `UPDATE campaigns SET
 			status = $3, channels = $4, sms_body = $5, email_subject = $6, email_body = $7,
 			version = $8, content_hash = $9, generation_token = $10, generation_expires_at = $11,
-			approved_by = $12, approved_at = $13, updated_at = now()
+			approved_by = $12, approved_at = $13, scheduled_at = $14, release_failure = $15, updated_at = now()
 		WHERE id = $1 AND version = $2
 		RETURNING `+campaignColumns,
 		string(c.ID), lockedVersion, string(c.Status), channelNames(c.Channels),
 		c.Drafts.SMS.Body, c.Drafts.Email.Subject, c.Drafts.Email.Body, c.Version, c.ContentHash,
-		nullString(c.GenerationToken), nullTime(c.GenerationExpiresAt), nullString(c.ApprovedBy), nullTime(c.ApprovedAt))
+		nullString(c.GenerationToken), nullTime(c.GenerationExpiresAt), nullString(c.ApprovedBy), nullTime(c.ApprovedAt),
+		nullTime(c.ScheduledAt), failure)
 	out, err := scanCampaign(row)
 	if errors.Is(err, campaign.ErrNotFound) {
 		return campaign.Campaign{}, campaign.ErrConflict
@@ -168,15 +203,17 @@ func scanCampaign(row pgx.Row) (campaign.Campaign, error) {
 		c                       campaign.Campaign
 		id, status              string
 		rule, unsupported       []byte
+		failure                 []byte
 		channels                []string
 		genToken, approvedBy    *string
 		genExpires, approvedAtP *time.Time
+		scheduledAt             *time.Time
 	)
 	err := row.Scan(&id, &c.Brief, &status, &rule, &c.Explanation, &unsupported,
 		&c.Counts.Total, &c.Counts.SMS, &c.Counts.Email, &channels,
 		&c.Drafts.SMS.Body, &c.Drafts.Email.Subject, &c.Drafts.Email.Body,
 		&c.Version, &c.ContentHash, &genToken, &genExpires, &approvedBy, &approvedAtP,
-		&c.CreatedAt, &c.UpdatedAt)
+		&scheduledAt, &failure, &c.CreatedAt, &c.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return campaign.Campaign{}, campaign.ErrNotFound
 	}
@@ -200,6 +237,15 @@ func scanCampaign(row pgx.Row) (campaign.Campaign, error) {
 	}
 	if approvedBy != nil && approvedAtP != nil {
 		c.ApprovedBy, c.ApprovedAt = *approvedBy, *approvedAtP
+	}
+	if scheduledAt != nil {
+		c.ScheduledAt = *scheduledAt
+	}
+	if failure != nil {
+		c.ReleaseFailure = &campaign.ReleaseFailure{}
+		if err := json.Unmarshal(failure, c.ReleaseFailure); err != nil {
+			return campaign.Campaign{}, fmt.Errorf("stored release failure of campaign %s: %w", id, err)
+		}
 	}
 	return c, nil
 }

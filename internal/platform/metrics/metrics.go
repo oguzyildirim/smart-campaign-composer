@@ -8,6 +8,7 @@ package metrics
 
 import (
 	"net/http"
+	"slices"
 	"strconv"
 	"time"
 
@@ -249,4 +250,45 @@ func (m *LLM) LLMAttempt(operation, outcome string, d time.Duration) {
 	if outcome == llmInvalidOutcome {
 		m.validationFailures.WithLabelValues(operation).Inc()
 	}
+}
+
+// Release records scheduled campaign releases. It implements
+// campaign.ReleaseMetrics.
+type Release struct {
+	releases *prometheus.CounterVec
+	lateness prometheus.Histogram
+}
+
+var _ campaign.ReleaseMetrics = (*Release)(nil)
+
+var releaseOutcomes = []campaign.ReleaseOutcome{campaign.ReleaseReleased, campaign.ReleaseFailed, campaign.ReleaseExpired}
+
+// NewRelease registers the release metrics on reg.
+func NewRelease(reg prometheus.Registerer) *Release {
+	m := &Release{
+		releases: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "campaign_releases_total",
+			Help: "Scheduled campaign releases by outcome (released, release_failed, expired).",
+		}, []string{"outcome"}),
+		lateness: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "campaign_release_lateness_seconds",
+			Help:    "Time between a campaign's scheduled time and its release decision, for every outcome.",
+			Buckets: []float64{.5, 1, 2.5, 5, 10, 30, 60, 300, 900, 3600},
+		}),
+	}
+	reg.MustRegister(m.releases, m.lateness)
+	for _, o := range releaseOutcomes {
+		m.releases.WithLabelValues(string(o))
+	}
+	return m
+}
+
+// CampaignReleased implements campaign.ReleaseMetrics. Outcomes outside
+// the known set are dropped, so labels stay bounded.
+func (m *Release) CampaignReleased(o campaign.ReleaseOutcome, lateness time.Duration) {
+	if !slices.Contains(releaseOutcomes, o) {
+		return
+	}
+	m.releases.WithLabelValues(string(o)).Inc()
+	m.lateness.Observe(lateness.Seconds())
 }

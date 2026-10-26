@@ -60,7 +60,10 @@ func newAPI(t *testing.T, opts fixtureOptions) apiFixture {
 	gen := campaign.NewGenerator(f.llm, segment.NewService(fixedCounter{Total: 120, SMS: 80, Email: 95}, now),
 		campaign.GeneratorConfig{SegmentTimeout: opts.callTimeout, DraftsTimeout: opts.callTimeout, MaxAttempts: 2}, logger)
 	f.svc = campaign.NewService(gen, f.store, audience,
-		campaign.ServiceConfig{GenerationTimeout: 10 * time.Second, PreviewSamples: 3}, now, logger)
+		campaign.ServiceConfig{
+			GenerationTimeout: 10 * time.Second, PreviewSamples: 3,
+			Schedule: campaign.ScheduleConfig{MinLead: time.Minute, MaxHorizon: 30 * 24 * time.Hour, ReleaseGrace: 15 * time.Minute},
+		}, now, logger)
 	r := httpserver.NewRouter(logger, 0)
 	MountCampaigns(r, CampaignRoutes{
 		Service: f.svc, Logger: logger, RequestTimeout: 5 * time.Second, CreateTimeout: 5 * time.Second,

@@ -10,14 +10,17 @@ const hints: Record<string, string> = {
   upstream_unavailable: 'Try again in a moment.',
   timeout: 'Try again in a moment.',
   network: 'Check that the API is running.',
+  invalid_state: 'Reload the page to see its current status.',
 }
 
 // describeError returns display text for any thrown value. Backend
-// messages are client-safe and rendered as plain text.
+// messages and field details are client-safe and rendered as plain text.
 export function describeError(err: unknown): string {
   if (err instanceof ApiError) {
+    const details = err.details.map((d) => `${d.path} ${d.message}`).join('; ')
+    const text = details ? `${err.message}: ${details}.` : err.message
     const hint = hints[err.code]
-    return hint ? `${err.message} ${hint}` : err.message
+    return hint ? `${text} ${hint}` : text
   }
   return 'Something went wrong.'
 }

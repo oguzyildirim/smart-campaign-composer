@@ -17,15 +17,39 @@ import {
 } from './guards'
 import { readSSE } from './sse'
 
-export const STATUSES = ['draft', 'audience_ready', 'drafts_ready', 'approved', 'sending', 'completed'] as const
+export const STATUSES = [
+  'draft',
+  'audience_ready',
+  'drafts_ready',
+  'scheduled',
+  'release_failed',
+  'expired',
+  'approved',
+  'sending',
+  'completed',
+] as const
 export type CampaignStatus = (typeof STATUSES)[number]
 
-// Statuses after human approval, as reported by the backend. Their content
-// can no longer change.
+// Statuses after human approval to send now, or after a scheduled
+// campaign's release, as reported by the backend. Deliveries exist.
 const APPROVED_STATUSES: readonly CampaignStatus[] = ['approved', 'sending', 'completed']
+
+// Statuses of a campaign approved for a later time that was not sent; a
+// cancel returns it to drafts.
+const SCHEDULE_STATUSES: readonly CampaignStatus[] = ['scheduled', 'release_failed', 'expired']
 
 export function isApproved(status: CampaignStatus): boolean {
   return APPROVED_STATUSES.includes(status)
+}
+
+export function isScheduleStatus(status: CampaignStatus): boolean {
+  return SCHEDULE_STATUSES.includes(status)
+}
+
+// holdsApproval: the campaign carries a human approval, so its content
+// can no longer change.
+export function holdsApproval(status: CampaignStatus): boolean {
+  return isApproved(status) || isScheduleStatus(status)
 }
 
 export const CHANNELS = ['sms', 'email'] as const
@@ -66,6 +90,13 @@ export interface Audience {
   counts: Counts
 }
 
+// ReleaseFailure is why a scheduled campaign was not sent.
+export interface ReleaseFailure {
+  code: string
+  error: string
+  details: FieldError[]
+}
+
 export interface Campaign {
   id: string
   brief: string
@@ -79,6 +110,8 @@ export interface Campaign {
   generating: boolean
   approvedBy: string | null
   approvedAt: string | null
+  scheduledAt: string | null
+  releaseFailure: ReleaseFailure | null
   createdAt: string
   updatedAt: string
 }
@@ -90,6 +123,7 @@ export interface CampaignSummary {
   counts: Counts
   channels: Channel[]
   approvedAt: string | null
+  scheduledAt: string | null
   createdAt: string
 }
 
@@ -193,6 +227,15 @@ export function parseCampaign(v: unknown): Campaign {
     generating: asBoolean(o.generating, 'generating'),
     approvedBy: nullable(o.approved_by, (s) => asString(s, 'approved_by')),
     approvedAt: nullable(o.approved_at, (s) => asString(s, 'approved_at')),
+    scheduledAt: nullable(o.scheduled_at, (s) => asString(s, 'scheduled_at')),
+    releaseFailure: nullable(o.release_failure, (f) => {
+      const fo = asObject(f, 'release_failure')
+      return {
+        code: asString(fo.code, 'release_failure.code'),
+        error: asString(fo.error, 'release_failure.error'),
+        details: parseFieldErrors(fo.details, 'release_failure.details'),
+      }
+    }),
     createdAt: asString(o.created_at, 'created_at'),
     updatedAt: asString(o.updated_at, 'updated_at'),
   }
@@ -208,6 +251,7 @@ function parseSummary(v: unknown, i: number): CampaignSummary {
     counts: parseCounts(o.counts, `${p}.counts`),
     channels: parseChannels(o.channels, `${p}.channels`),
     approvedAt: nullable(o.approved_at, (s) => asString(s, `${p}.approved_at`)),
+    scheduledAt: nullable(o.scheduled_at, (s) => asString(s, `${p}.scheduled_at`)),
     createdAt: asString(o.created_at, `${p}.created_at`),
   }
 }
@@ -303,14 +347,46 @@ export async function previewCampaign(id: string, signal?: AbortSignal): Promise
   return parsed(() => parsePreview(body))
 }
 
+// ApproveInput approves the reviewed version and hash; scheduled_at
+// (RFC 3339 with offset) approves for release at that time instead.
 export interface ApproveInput {
   version: number
   content_hash: string
   approved_by: string
+  scheduled_at?: string
 }
 
 export async function approveCampaign(id: string, input: ApproveInput, signal?: AbortSignal): Promise<Campaign> {
   const body = await requestJSON('POST', `${base}/${encodeURIComponent(id)}/approve`, input, {
+    signal,
+    timeoutMs: WRITE_TIMEOUT_MS,
+  })
+  return parsed(() => parseCampaign(body))
+}
+
+export interface RescheduleInput {
+  version: number
+  content_hash: string
+  scheduled_at: string
+  actor: string
+}
+
+export async function rescheduleCampaign(id: string, input: RescheduleInput, signal?: AbortSignal): Promise<Campaign> {
+  const body = await requestJSON('POST', `${base}/${encodeURIComponent(id)}/reschedule`, input, {
+    signal,
+    timeoutMs: WRITE_TIMEOUT_MS,
+  })
+  return parsed(() => parseCampaign(body))
+}
+
+export interface CancelInput {
+  version: number
+  content_hash: string
+  actor: string
+}
+
+export async function cancelCampaign(id: string, input: CancelInput, signal?: AbortSignal): Promise<Campaign> {
+  const body = await requestJSON('POST', `${base}/${encodeURIComponent(id)}/cancel`, input, {
     signal,
     timeoutMs: WRITE_TIMEOUT_MS,
   })

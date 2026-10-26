@@ -109,6 +109,7 @@ func run(ctx context.Context) error {
 		GenerationTimeout:   cfg.LLM.RouteTimeout(),
 		PreviewSamples:      previewSamples,
 		DeliveryMaxAttempts: cfg.Delivery.MaxAttempts,
+		Schedule:            scheduleConfig(cfg.Schedule),
 	}, time.Now, logger)
 	progress := monitoring.NewHub(postgres.NewProgressRepository(pool), monitoring.HubConfig{
 		Interval:   cfg.API.Progress.PollInterval,
@@ -150,6 +151,10 @@ func run(ctx context.Context) error {
 	// open progress streams so shutdown is not held up by them.
 	srv.RegisterOnShutdown(progress.Close)
 	return httpserver.Run(ctx, srv, cfg.ShutdownTimeout, logger)
+}
+
+func scheduleConfig(c config.ScheduleConfig) campaign.ScheduleConfig {
+	return campaign.ScheduleConfig{MinLead: c.MinLead, MaxHorizon: c.MaxHorizon, ReleaseGrace: c.ReleaseGrace}
 }
 
 // newLLMClient returns the configured model client. The API key is

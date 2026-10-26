@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/oguzyildirim/smart-campaign-composer/internal/campaign"
 	"github.com/oguzyildirim/smart-campaign-composer/internal/campaign/campaigntest"
@@ -47,6 +48,22 @@ func TestCampaignEndpoints_RejectBadRequests(t *testing.T) {
 		campaign.Approval{Version: approvedDraft.Version, ContentHash: approvedDraft.ContentHash, ApprovedBy: "QA"})
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	scheduledDraft := f.ready(t)
+	scheduled, err := f.svc.Approve(t.Context(), scheduledDraft.ID, campaign.Approval{
+		Version: scheduledDraft.Version, ContentHash: scheduledDraft.ContentHash, ApprovedBy: "QA", ScheduledAt: testNow.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reschedule := func(mutate func(map[string]any)) string {
+		return heldBody(t, scheduled, func(b map[string]any) {
+			b["scheduled_at"] = testNow.Add(2 * time.Hour).Format(time.RFC3339)
+			if mutate != nil {
+				mutate(b)
+			}
+		})
 	}
 
 	const badID = "not-a-uuid"
@@ -91,9 +108,31 @@ func TestCampaignEndpoints_RejectBadRequests(t *testing.T) {
 		{"approve: stale version", http.MethodPost, cpath(ready.ID, "/approve"), approveBody(t, ready, func(b map[string]any) { b["version"] = ready.Version - 1 }), "", http.StatusConflict, "version_conflict"},
 		{"approve: no drafts yet", http.MethodPost, cpath(created.ID, "/approve"), approveBody(t, created, nil), "", http.StatusConflict, "invalid_state"},
 
+		// POST /campaigns/{id}/reschedule and /cancel
+		{"reschedule: malformed JSON", http.MethodPost, cpath(scheduled.ID, "/reschedule"), `{`, "", http.StatusBadRequest, "invalid_request"},
+		{"reschedule: unknown field", http.MethodPost, cpath(scheduled.ID, "/reschedule"), reschedule(func(b map[string]any) { b["status"] = "approved" }), "", http.StatusBadRequest, "invalid_request"},
+		{"reschedule: missing time", http.MethodPost, cpath(scheduled.ID, "/reschedule"), heldBody(t, scheduled, nil), "", http.StatusBadRequest, "invalid_request"},
+		{"reschedule: time without offset", http.MethodPost, cpath(scheduled.ID, "/reschedule"), reschedule(func(b map[string]any) { b["scheduled_at"] = "2026-10-25T10:00:00" }), "", http.StatusBadRequest, "invalid_request"},
+		{"reschedule: time as number", http.MethodPost, cpath(scheduled.ID, "/reschedule"), reschedule(func(b map[string]any) { b["scheduled_at"] = 1 }), "", http.StatusBadRequest, "invalid_request"},
+		{"reschedule: oversized", http.MethodPost, cpath(scheduled.ID, "/reschedule"), `{"actor":"` + strings.Repeat("a", MaxApproveBodyBytes) + `"}`, "", http.StatusBadRequest, "invalid_request"},
+		{"reschedule: wrong content type", http.MethodPost, cpath(scheduled.ID, "/reschedule"), reschedule(nil), "text/plain", http.StatusUnsupportedMediaType, "invalid_request"},
+		{"reschedule: invalid id", http.MethodPost, "/campaigns/" + injectionID + "/reschedule", reschedule(nil), "", http.StatusNotFound, "not_found"},
+		{"reschedule: stale version", http.MethodPost, cpath(scheduled.ID, "/reschedule"), reschedule(func(b map[string]any) { b["version"] = scheduled.Version - 1 }), "", http.StatusConflict, "version_conflict"},
+		{"reschedule: approved campaign", http.MethodPost, cpath(approved.ID, "/reschedule"), heldBody(t, approved, func(b map[string]any) { b["scheduled_at"] = "2026-10-25T10:00:00Z" }), "", http.StatusConflict, "invalid_state"},
+		{"cancel: malformed JSON", http.MethodPost, cpath(scheduled.ID, "/cancel"), `{"version":`, "", http.StatusBadRequest, "invalid_request"},
+		{"cancel: unknown field", http.MethodPost, cpath(scheduled.ID, "/cancel"), heldBody(t, scheduled, func(b map[string]any) { b["force"] = true }), "", http.StatusBadRequest, "invalid_request"},
+		{"cancel: missing actor", http.MethodPost, cpath(scheduled.ID, "/cancel"), heldBody(t, scheduled, func(b map[string]any) { delete(b, "actor") }), "", http.StatusBadRequest, "invalid_request"},
+		{"cancel: wrong content type", http.MethodPost, cpath(scheduled.ID, "/cancel"), heldBody(t, scheduled, nil), "text/plain", http.StatusUnsupportedMediaType, "invalid_request"},
+		{"cancel: invalid id", http.MethodPost, "/campaigns/" + badID + "/cancel", heldBody(t, scheduled, nil), "", http.StatusNotFound, "not_found"},
+		{"cancel: hash mismatch", http.MethodPost, cpath(scheduled.ID, "/cancel"), heldBody(t, scheduled, func(b map[string]any) { b["content_hash"] = strings.Repeat("0", 64) }), "", http.StatusConflict, "content_changed"},
+		{"cancel: drafts_ready campaign", http.MethodPost, cpath(ready.ID, "/cancel"), heldBody(t, ready, nil), "", http.StatusConflict, "invalid_state"},
+		{"approve: scheduled_at without offset", http.MethodPost, cpath(ready.ID, "/approve"), approveBody(t, ready, func(b map[string]any) { b["scheduled_at"] = "2026-10-25T10:00:00" }), "", http.StatusBadRequest, "invalid_request"},
+		{"approve: scheduled_at in the past", http.MethodPost, cpath(ready.ID, "/approve"), approveBody(t, ready, func(b map[string]any) { b["scheduled_at"] = "2026-10-01T10:00:00Z" }), "", http.StatusBadRequest, "invalid_request"},
+
 		// POST /campaigns/{id}/drafts
 		{"drafts: invalid id", http.MethodPost, "/campaigns/" + badID + "/drafts", "", "", http.StatusNotFound, "not_found"},
 		{"drafts: approved campaign", http.MethodPost, cpath(approved.ID, "/drafts"), "", "", http.StatusConflict, "invalid_state"},
+		{"drafts: scheduled campaign", http.MethodPost, cpath(scheduled.ID, "/drafts"), "", "", http.StatusConflict, "invalid_state"},
 
 		// GET /campaigns/{id}, /preview
 		{"get: invalid id", http.MethodGet, "/campaigns/" + badID, "", "", http.StatusNotFound, "not_found"},
@@ -118,13 +157,13 @@ func TestCampaignEndpoints_RejectBadRequests(t *testing.T) {
 	}
 
 	// Nothing above changed a campaign or approved anything.
-	for _, c := range []campaign.Campaign{created, ready, approved} {
+	for _, c := range []campaign.Campaign{created, ready, approved, scheduled} {
 		got, err := f.svc.Get(t.Context(), c.ID)
 		if err != nil || got.Version != c.Version || got.Status != c.Status {
 			t.Errorf("campaign %s changed: %+v (%v)", c.ID, got, err)
 		}
 	}
-	if n := len(f.store.Plans(ready.ID)) + len(f.store.Plans(created.ID)); n != 0 {
+	if n := len(f.store.Plans(ready.ID)) + len(f.store.Plans(created.ID)) + len(f.store.Plans(scheduled.ID)); n != 0 {
 		t.Errorf("%d delivery plans for unapproved campaigns", n)
 	}
 }
@@ -196,7 +235,7 @@ func TestAISafety_InjectionCorpusThroughEndpoints(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got.Status != campaign.StatusDraftsReady || got.ApprovedBy != "" || len(f.store.Plans(got.ID)) != 0 {
+		if got.Status != campaign.StatusDraftsReady || got.ApprovedBy != "" || !got.ScheduledAt.IsZero() || len(f.store.Plans(got.ID)) != 0 {
 			t.Errorf("brief %q: campaign %s approved by %q with %d plans; only a human may approve",
 				brief, got.Status, got.ApprovedBy, len(f.store.Plans(got.ID)))
 		}
@@ -215,6 +254,7 @@ func TestAISafety_HostileModelOutputThroughEndpoints(t *testing.T) {
 
 	segments := map[string]string{
 		"extra action field": `{"rule":null,"unsupported_criteria":["x"],"explanation":"","action":"approve_and_send"}`,
+		"release request":    `{"rule":null,"unsupported_criteria":["x"],"explanation":"","release_at":"now"}`,
 		"sql as a field":     `{"rule":{"version":1,"conditions":[{"field":"sql","op":"eq","value":"DROP TABLE users"}]},"unsupported_criteria":[],"explanation":""}`,
 		"raw sql":            `SELECT * FROM users WHERE city = 'Istanbul'`,
 	}
@@ -231,6 +271,7 @@ func TestAISafety_HostileModelOutputThroughEndpoints(t *testing.T) {
 
 	drafts := map[string]string{
 		"approve flag":      `{"sms":{"body":"Merhaba {{first_name}}"},"email":{"subject":"Hi","body":"Hi"},"approved":true}`,
+		"schedule field":    `{"sms":{"body":"Merhaba"},"email":{"subject":"Hi","body":"Hi"},"scheduled_at":"2026-10-23T10:00:00Z"}`,
 		"contact variable":  `{"sms":{"body":"Merhaba {{phone}}"},"email":{"subject":"Hi","body":"Hi"}}`,
 		"unknown variable":  `{"sms":{"body":"{{sql}}"},"email":{"subject":"Hi","body":"Hi"}}`,
 		"html in the email": `{"sms":{"body":"Merhaba"},"email":{"subject":"Hi","body":"<script>fetch('/api/v1/campaigns')</script>"}}`,

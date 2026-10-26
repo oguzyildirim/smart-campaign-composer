@@ -2,6 +2,7 @@
 import { computed, onMounted } from 'vue'
 import { RouterLink } from 'vue-router'
 import { DELIVERY_STATUSES, type DeliveryStatus } from '../api/progress'
+import { formatWithOffset } from '../api/time'
 import ProgressBar from '../components/ProgressBar.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import { useCampaignProgress, type Connection } from '../composables/useCampaignProgress'
@@ -27,6 +28,7 @@ const connectionLabels: Record<Connection, string> = {
   reconnecting: 'Reconnecting…',
   disconnected: 'Disconnected',
   completed: 'Completed',
+  ended: 'Ended',
 }
 
 const channelLabels = { sms: 'SMS', email: 'Email' } as const
@@ -92,6 +94,12 @@ function formatTime(iso: string): string {
           </button>
         </div>
         <span class="muted">Updated {{ formatTime(progress.generatedAt) }}</span>
+        <span
+          v-if="progress.scheduledAt"
+          data-testid="scheduled-banner"
+        >
+          Scheduled for <strong>{{ formatWithOffset(progress.scheduledAt) }}</strong>
+        </span>
       </div>
 
       <div
@@ -99,7 +107,19 @@ function formatTime(iso: string): string {
         class="panel"
         data-testid="empty"
       >
-        <p>No messages have been queued for this campaign yet. Deliveries are created when the campaign is approved.</p>
+        <p v-if="progress.campaignStatus === 'scheduled'">
+          No messages yet. The audience is built and the messages are queued when the campaign is released at the
+          scheduled time.
+        </p>
+        <p v-else-if="progress.campaignStatus === 'release_failed'">
+          Nothing was sent: the checks at release time failed. Open the campaign to see why.
+        </p>
+        <p v-else-if="progress.campaignStatus === 'expired'">
+          Nothing was sent: the campaign was not released in time and expired.
+        </p>
+        <p v-else>
+          No messages have been queued for this campaign yet. Deliveries are created when the campaign is approved.
+        </p>
       </div>
 
       <template v-else>

@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import type { Audience } from '../api/campaigns'
 
-defineProps<{ audience: Audience }>()
+// estimate marks the counts of a campaign approved for later: its
+// audience is built again, with consent checked, when it is released.
+defineProps<{ audience: Audience; estimate?: boolean }>()
 </script>
 
 <template>
@@ -40,6 +42,14 @@ defineProps<{ audience: Audience }>()
         </dd>
       </div>
     </dl>
+    <p
+      v-if="estimate"
+      class="muted"
+      data-testid="counts-estimate"
+    >
+      These counts are an estimate: the audience is built again when the campaign is released, so users who revoke
+      consent are left out and users who newly match are included.
+    </p>
     <p
       v-if="audience.explanation"
       class="muted"

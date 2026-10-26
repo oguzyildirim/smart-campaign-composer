@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -40,6 +41,8 @@ type CampaignService interface {
 	Edit(ctx context.Context, id campaign.ID, e campaign.Edit) (campaign.Campaign, error)
 	Preview(ctx context.Context, id campaign.ID) (campaign.Preview, error)
 	Approve(ctx context.Context, id campaign.ID, a campaign.Approval) (campaign.Campaign, error)
+	Reschedule(ctx context.Context, id campaign.ID, r campaign.Reschedule) (campaign.Campaign, error)
+	Cancel(ctx context.Context, id campaign.ID, r campaign.Cancel) (campaign.Campaign, error)
 	BeginGeneration(ctx context.Context, id campaign.ID) (*campaign.Generation, error)
 }
 
@@ -73,6 +76,8 @@ func MountCampaigns(r chi.Router, cfg CampaignRoutes) {
 	r.With(timeout).Patch("/campaigns/{id}", h.edit)
 	r.With(timeout).Get("/campaigns/{id}/preview", h.preview)
 	r.With(timeout).Post("/campaigns/{id}/approve", h.approve)
+	r.With(timeout).Post("/campaigns/{id}/reschedule", h.reschedule)
+	r.With(timeout).Post("/campaigns/{id}/cancel", h.cancel)
 	r.Post("/campaigns/{id}/drafts", h.generate)
 }
 
@@ -99,11 +104,48 @@ type EditRequest struct {
 }
 
 // ApproveRequest is the body of POST /campaigns/{id}/approve: the version
-// and content hash the reviewer saw, and who approves.
+// and content hash the reviewer saw, and who approves. ScheduledAt, an
+// RFC 3339 time with an offset, approves for release at that time instead
+// of sending now; leaving it out sends now, and an explicit null is
+// rejected, so a client bug can never turn a schedule into a send.
 type ApproveRequest struct {
+	Version     *int           `json:"version"`
+	ContentHash *string        `json:"content_hash"`
+	ApprovedBy  *string        `json:"approved_by"`
+	ScheduledAt optionalString `json:"scheduled_at"`
+}
+
+// optionalString tells an absent JSON field (Set false) from an explicit
+// null (Set true, Null true). encoding/json calls UnmarshalJSON for null
+// too, but never for a missing field.
+type optionalString struct {
+	Set   bool
+	Null  bool
+	Value string
+}
+
+func (o *optionalString) UnmarshalJSON(b []byte) error {
+	o.Set = true
+	if string(b) == "null" {
+		o.Null = true
+		return nil
+	}
+	return json.Unmarshal(b, &o.Value)
+}
+
+// RescheduleRequest is the body of POST /campaigns/{id}/reschedule.
+type RescheduleRequest struct {
 	Version     *int    `json:"version"`
 	ContentHash *string `json:"content_hash"`
-	ApprovedBy  *string `json:"approved_by"`
+	ScheduledAt *string `json:"scheduled_at"`
+	Actor       *string `json:"actor"`
+}
+
+// CancelRequest is the body of POST /campaigns/{id}/cancel.
+type CancelRequest struct {
+	Version     *int    `json:"version"`
+	ContentHash *string `json:"content_hash"`
+	Actor       *string `json:"actor"`
 }
 
 // CampaignResponse is a campaign as the API returns it.
@@ -120,8 +162,21 @@ type CampaignResponse struct {
 	Generating  bool                `json:"generating"`
 	ApprovedBy  *string             `json:"approved_by"`
 	ApprovedAt  *time.Time          `json:"approved_at"`
-	CreatedAt   time.Time           `json:"created_at"`
-	UpdatedAt   time.Time           `json:"updated_at"`
+	// ScheduledAt is the release time of a campaign approved for later,
+	// kept after its release, release failure, or expiry.
+	ScheduledAt *time.Time `json:"scheduled_at"`
+	// ReleaseFailure explains a release_failed campaign.
+	ReleaseFailure *ReleaseFailureResponse `json:"release_failure"`
+	CreatedAt      time.Time               `json:"created_at"`
+	UpdatedAt      time.Time               `json:"updated_at"`
+}
+
+// ReleaseFailureResponse is why a scheduled campaign was not sent, in the
+// shape of ErrorResponse.
+type ReleaseFailureResponse struct {
+	Error   string               `json:"error"`
+	Code    string               `json:"code"`
+	Details []content.FieldError `json:"details"`
 }
 
 // AudienceResponse is the audience proposal fixed at creation. Summary is
@@ -159,14 +214,15 @@ var fieldLimits = content.WorstCase{
 
 // CampaignSummary is a list entry.
 type CampaignSummary struct {
-	ID         string            `json:"id"`
-	Brief      string            `json:"brief"`
-	Status     campaign.Status   `json:"status"`
-	Counts     segment.Counts    `json:"counts"`
-	Channels   []content.Channel `json:"channels"`
-	ApprovedAt *time.Time        `json:"approved_at"`
-	CreatedAt  time.Time         `json:"created_at"`
-	UpdatedAt  time.Time         `json:"updated_at"`
+	ID          string            `json:"id"`
+	Brief       string            `json:"brief"`
+	Status      campaign.Status   `json:"status"`
+	Counts      segment.Counts    `json:"counts"`
+	Channels    []content.Channel `json:"channels"`
+	ApprovedAt  *time.Time        `json:"approved_at"`
+	ScheduledAt *time.Time        `json:"scheduled_at"`
+	CreatedAt   time.Time         `json:"created_at"`
+	UpdatedAt   time.Time         `json:"updated_at"`
 }
 
 // ListResponse is the body of GET /campaigns.
@@ -265,7 +321,7 @@ func (h campaignHandler) list(w http.ResponseWriter, r *http.Request) {
 		out.Campaigns[i] = CampaignSummary{
 			ID: string(c.ID), Brief: c.Brief, Status: c.Status, Counts: c.Counts,
 			Channels: nonNilChannels(c.Channels), ApprovedAt: optionalTime(c.ApprovedAt),
-			CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt,
+			ScheduledAt: optionalTime(c.ScheduledAt), CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt,
 		}
 	}
 	httpserver.WriteJSON(w, http.StatusOK, out)
@@ -370,7 +426,7 @@ func (h campaignHandler) approve(w http.ResponseWriter, r *http.Request) {
 	}
 	var req ApproveRequest
 	if !h.decode(w, r, MaxApproveBodyBytes, &req,
-		"request body must be a JSON object with version, content_hash, and approved_by") {
+		"request body must be a JSON object with version, content_hash, approved_by, and optionally scheduled_at") {
 		return
 	}
 	if req.Version == nil || req.ContentHash == nil || req.ApprovedBy == nil {
@@ -378,11 +434,73 @@ func (h campaignHandler) approve(w http.ResponseWriter, r *http.Request) {
 			"version, content_hash, and approved_by are required", nil, nil)
 		return
 	}
-	c, err := h.svc.Approve(r.Context(), id, campaign.Approval{
-		Version: *req.Version, ContentHash: *req.ContentHash, ApprovedBy: *req.ApprovedBy,
-	})
+	a := campaign.Approval{Version: *req.Version, ContentHash: *req.ContentHash, ApprovedBy: *req.ApprovedBy}
+	switch {
+	case req.ScheduledAt.Null:
+		writeCampaignError(w, http.StatusBadRequest, codeInvalidRequest, "the request is invalid",
+			[]content.FieldError{{Path: "scheduled_at", Message: "must be a time or left out to send now, not null"}}, nil)
+		return
+	case req.ScheduledAt.Set:
+		var err error
+		if a.ScheduledAt, err = campaign.ParseScheduledAt(req.ScheduledAt.Value); err != nil {
+			h.writeError(w, r, "approve campaign", err)
+			return
+		}
+	}
+	c, err := h.svc.Approve(r.Context(), id, a)
 	if err != nil {
 		h.writeError(w, r, "approve campaign", err)
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusOK, h.campaignResponse(c))
+}
+
+func (h campaignHandler) reschedule(w http.ResponseWriter, r *http.Request) {
+	id, ok := h.campaignID(w, r)
+	if !ok {
+		return
+	}
+	var req RescheduleRequest
+	if !h.decode(w, r, MaxApproveBodyBytes, &req,
+		"request body must be a JSON object with version, content_hash, scheduled_at, and actor") {
+		return
+	}
+	if req.Version == nil || req.ContentHash == nil || req.ScheduledAt == nil || req.Actor == nil {
+		writeCampaignError(w, http.StatusBadRequest, codeInvalidRequest,
+			"version, content_hash, scheduled_at, and actor are required", nil, nil)
+		return
+	}
+	at, err := campaign.ParseScheduledAt(*req.ScheduledAt)
+	if err != nil {
+		h.writeError(w, r, "reschedule campaign", err)
+		return
+	}
+	c, err := h.svc.Reschedule(r.Context(), id, campaign.Reschedule{
+		Version: *req.Version, ContentHash: *req.ContentHash, ScheduledAt: at, Actor: *req.Actor,
+	})
+	if err != nil {
+		h.writeError(w, r, "reschedule campaign", err)
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusOK, h.campaignResponse(c))
+}
+
+func (h campaignHandler) cancel(w http.ResponseWriter, r *http.Request) {
+	id, ok := h.campaignID(w, r)
+	if !ok {
+		return
+	}
+	var req CancelRequest
+	if !h.decode(w, r, MaxApproveBodyBytes, &req, "request body must be a JSON object with version, content_hash, and actor") {
+		return
+	}
+	if req.Version == nil || req.ContentHash == nil || req.Actor == nil {
+		writeCampaignError(w, http.StatusBadRequest, codeInvalidRequest, "version, content_hash, and actor are required", nil, nil)
+		return
+	}
+	c, err := h.svc.Cancel(r.Context(), id, campaign.Cancel{Version: *req.Version, ContentHash: *req.ContentHash, Actor: *req.Actor})
+	if err != nil {
+		h.writeError(w, r, "cancel campaign", err)
 		return
 	}
 	httpserver.WriteJSON(w, http.StatusOK, h.campaignResponse(c))
@@ -430,6 +548,7 @@ func (h campaignHandler) campaignResponse(c campaign.Campaign) CampaignResponse 
 		ContentHash: c.ContentHash,
 		Generating:  c.Generating(h.now()),
 		ApprovedAt:  optionalTime(c.ApprovedAt),
+		ScheduledAt: optionalTime(c.ScheduledAt),
 		CreatedAt:   c.CreatedAt,
 		UpdatedAt:   c.UpdatedAt,
 	}
@@ -438,6 +557,13 @@ func (h campaignHandler) campaignResponse(c campaign.Campaign) CampaignResponse 
 	}
 	if c.ApprovedBy != "" {
 		out.ApprovedBy = &c.ApprovedBy
+	}
+	if f := c.ReleaseFailure; f != nil {
+		details := f.Details
+		if details == nil {
+			details = []content.FieldError{}
+		}
+		out.ReleaseFailure = &ReleaseFailureResponse{Error: f.Message, Code: string(f.Code), Details: details}
 	}
 	if c.HasDrafts() {
 		out.Drafts = draftsBody(c.Drafts)

@@ -48,6 +48,7 @@ type fixtureEnv struct {
 	audience *campaigntest.Audience
 	llm      *mockllm.Client
 	clock    *clock
+	gen      *campaign.Generator
 }
 
 // defaultAudience has consented recipients on both channels with short
@@ -83,9 +84,20 @@ func newEnvWithAudience(t *testing.T, aud map[content.Channel]campaign.ChannelAu
 	gen := campaign.NewGenerator(e.llm, segments, campaign.GeneratorConfig{
 		SegmentTimeout: 5 * time.Second, DraftsTimeout: 5 * time.Second, MaxAttempts: 2,
 	}, logger)
-	e.svc = campaign.NewService(gen, e.store, e.audience,
-		campaign.ServiceConfig{GenerationTimeout: 10 * time.Second, PreviewSamples: 3, DeliveryMaxAttempts: 4}, e.clock.Now, logger)
+	e.gen = gen
+	e.svc = e.withReleaseMetrics(nil)
 	return e
+}
+
+// withReleaseMetrics returns a service over e's fakes reporting releases
+// to m.
+func (e fixtureEnv) withReleaseMetrics(m campaign.ReleaseMetrics) *campaign.Service {
+	return campaign.NewService(e.gen, e.store, e.audience,
+		campaign.ServiceConfig{
+			GenerationTimeout: 10 * time.Second, PreviewSamples: 3, DeliveryMaxAttempts: 4,
+			Schedule:       campaign.ScheduleConfig{MinLead: time.Minute, MaxHorizon: 30 * 24 * time.Hour, ReleaseGrace: 15 * time.Minute},
+			ReleaseMetrics: m,
+		}, e.clock.Now, slog.New(slog.DiscardHandler))
 }
 
 func requireCode(t *testing.T, err error, want campaign.ErrorCode) {

@@ -1,8 +1,8 @@
 import { flushPromises, mount } from '@vue/test-utils'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createMemoryHistory } from 'vue-router'
 import { makeRouter } from '../../router'
-import { CAMPAIGN_ID, errorResponse, FakeEventSource, jsonResponse, progressJSON, stubFetch } from '../../test/helpers'
+import { CAMPAIGN_ID, errorResponse, FakeEventSource, jsonResponse, progressJSON, setTimeZone, stubFetch } from '../../test/helpers'
 import CampaignDashboardView from '../CampaignDashboardView.vue'
 
 const progressPath = `GET /api/v1/campaigns/${CAMPAIGN_ID}/progress`
@@ -19,8 +19,15 @@ function cell(wrapper: Awaited<ReturnType<typeof mountView>>, channel: string, s
   return wrapper.get(`[data-testid="count-${channel}-${status}"]`).text()
 }
 
+let restoreTZ = () => {}
+
 beforeEach(() => {
   FakeEventSource.install()
+})
+
+afterEach(() => {
+  restoreTZ()
+  restoreTZ = () => {}
 })
 
 describe('CampaignDashboardView', () => {
@@ -179,5 +186,66 @@ describe('CampaignDashboardView', () => {
     })
     const wrapper = await mountView()
     expect(wrapper.get('[data-testid="empty"]').text()).toContain('No messages')
+  })
+
+  it('shows when a scheduled campaign will be released, then switches to progress on release', async () => {
+    restoreTZ = setTimeZone('Europe/Istanbul')
+    const none = { queued: 0, processing: 0, sent: 0, failed: 0, retrying: 0, total: 0 }
+    stubFetch({
+      [progressPath]: () =>
+        jsonResponse(progressJSON({
+          campaign_status: 'scheduled',
+          scheduled_at: '2026-10-30T07:00:00Z',
+          channels: [{ channel: 'sms', ...none, sent_recently: 0, percent_done: 0 }],
+          totals: none,
+          failures: [],
+          percent_done: 0,
+        })),
+    })
+    const wrapper = await mountView()
+    expect(wrapper.get('[data-testid="campaign-status"]').text()).toBe('Scheduled')
+    expect(wrapper.get('[data-testid="scheduled-banner"]').text()).toMatch(/10:00.*\(UTC\+03:00\)/)
+    expect(wrapper.get('[data-testid="empty"]').text()).toContain('released')
+    const es = FakeEventSource.latest()
+    es.open()
+
+    // The release arrives as an ordinary snapshot: no reload needed.
+    es.emit('snapshot', progressJSON({ campaign_status: 'sending', scheduled_at: '2026-10-30T07:00:00Z' }), '2')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="campaign-status"]').text()).toBe('Sending')
+    expect(wrapper.find('[data-testid="empty"]').exists()).toBe(false)
+    expect(cell(wrapper, 'sms', 'sent')).toBe('140')
+    expect(wrapper.get('[data-testid="scheduled-banner"]').text()).toContain('Scheduled for')
+  })
+
+  it.each(['release_failed', 'expired'] as const)('explains a %s campaign that sent nothing', async (status) => {
+    const none = { queued: 0, processing: 0, sent: 0, failed: 0, retrying: 0, total: 0 }
+    stubFetch({
+      [progressPath]: () =>
+        jsonResponse(progressJSON({
+          campaign_status: status,
+          scheduled_at: '2026-10-30T07:00:00Z',
+          channels: [],
+          totals: none,
+          failures: [],
+          percent_done: 0,
+        })),
+    })
+    const wrapper = await mountView()
+    expect(wrapper.get('[data-testid="empty"]').text()).toContain('Nothing was sent')
+    // Expired is final: no stream. A failed release may still be canceled.
+    expect(FakeEventSource.instances).toHaveLength(status === 'expired' ? 0 : 1)
+    if (status === 'expired') expect(wrapper.get('[data-testid="connection"]').text()).toContain('Ended')
+  })
+
+  it('closes the stream when the campaign expires', async () => {
+    stubFetch({ [progressPath]: () => jsonResponse(progressJSON({ campaign_status: 'scheduled', scheduled_at: '2026-10-30T07:00:00Z' })) })
+    const wrapper = await mountView()
+    const es = FakeEventSource.latest()
+    es.open()
+    es.emit('complete', progressJSON({ campaign_status: 'expired', scheduled_at: '2026-10-30T07:00:00Z' }))
+    await flushPromises()
+    expect(es.closed).toBe(true)
+    expect(wrapper.get('[data-testid="connection"]').text()).toContain('Ended')
   })
 })

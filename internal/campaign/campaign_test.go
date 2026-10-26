@@ -18,9 +18,17 @@ func TestCanTransition(t *testing.T) {
 		{StatusApproved, StatusSending}:          true, // first delivery claimed
 		{StatusApproved, StatusCompleted}:        true, // no delivery was left to send
 		{StatusSending, StatusCompleted}:         true,
+		{StatusDraftsReady, StatusScheduled}:     true, // approve for later
+		{StatusScheduled, StatusScheduled}:       true, // reschedule
+		{StatusScheduled, StatusApproved}:        true, // release
+		{StatusScheduled, StatusReleaseFailed}:   true,
+		{StatusScheduled, StatusExpired}:         true,
+		{StatusScheduled, StatusDraftsReady}:     true, // cancel
+		{StatusReleaseFailed, StatusDraftsReady}: true, // cancel
+		{StatusExpired, StatusDraftsReady}:       true, // cancel
 	}
 	all := []Status{StatusDraft, StatusAudienceReady, StatusDraftsReady, StatusApproved, StatusSending, StatusCompleted,
-		Status("cancelled"), Status("")}
+		StatusScheduled, StatusReleaseFailed, StatusExpired, Status("cancelled"), Status("")}
 	for _, from := range all {
 		for _, to := range all {
 			want := legal[[2]Status{from, to}]

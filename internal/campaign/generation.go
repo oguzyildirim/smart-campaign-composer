@@ -42,7 +42,7 @@ func (s *Service) BeginGeneration(ctx context.Context, id ID) (*Generation, erro
 	_, err = s.update(ctx, id, func(_ context.Context, _ AudienceInspector, c Campaign) (*Write, error) {
 		now := s.now()
 		switch {
-		case !CanTransition(c.Status, StatusDraftsReady):
+		case !canGenerate(c.Status):
 			return nil, fail(CodeInvalidState, "drafts can only be generated after the audience is ready and before approval")
 		case c.Generating(now):
 			return nil, fail(CodeGenerationInProgress, "")
@@ -56,6 +56,13 @@ func (s *Service) BeginGeneration(ctx context.Context, id ID) (*Generation, erro
 		return nil, err
 	}
 	return g, nil
+}
+
+// canGenerate reports whether drafts may be generated in status: only
+// before approval. A cancel also leads to drafts_ready, but generation
+// must not be a way out of an approval.
+func canGenerate(s Status) bool {
+	return s == StatusAudienceReady || s == StatusDraftsReady
 }
 
 func newToken() (string, error) {
@@ -103,7 +110,7 @@ func (g *Generation) Run(ctx context.Context, onDelta func(FieldDelta)) (Campaig
 		if c.GenerationToken != g.token || !c.Generating(g.s.now()) {
 			return nil, fail(CodeInvalidState, "the generation lease expired before the drafts were ready")
 		}
-		if !CanTransition(c.Status, StatusDraftsReady) {
+		if !canGenerate(c.Status) {
 			return nil, fail(CodeInvalidState, "")
 		}
 		from := c.Status

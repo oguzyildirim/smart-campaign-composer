@@ -7,6 +7,9 @@ const labels: Record<CampaignStatus, string> = {
   draft: 'Draft',
   audience_ready: 'Audience ready',
   drafts_ready: 'Drafts ready',
+  scheduled: 'Scheduled',
+  release_failed: 'Release failed',
+  expired: 'Expired',
   approved: 'Approved',
   sending: 'Sending',
   completed: 'Completed',
@@ -36,6 +39,15 @@ const labels: Record<CampaignStatus, string> = {
 .status--completed {
   background: #dcfce7;
   color: #14532d;
+}
+.status--scheduled {
+  background: #e0e7ff;
+  color: #312e81;
+}
+.status--release_failed,
+.status--expired {
+  background: #fee2e2;
+  color: #7f1d1d;
 }
 .status--sending {
   background: #fef9c3;
